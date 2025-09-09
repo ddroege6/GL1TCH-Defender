@@ -1,4 +1,6 @@
-# GL1TCH DEFENSE
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/a27c0931-056f-46b4-a8a5-d56c92c9597c" />
+
+# GL1TCH DEFENDER
 _A neon, top-down arcade defense built with Phaser 3._
 
 Corruption spreads across a synthetic grid while glitch-viruses hunt you. **Blink** to reposition. **Cleanse** to push back the spread. Secure sectors, survive waves, and keep the system from falling past 70% corruption.
