@@ -1,0 +1,8 @@
+html, body {
+  margin: 0; padding: 0;
+  background: #0b0f14;
+  height: 100%; width: 100%;
+  touch-action: none;
+}
+#game { width: 100vw; height: 100vh; }
+canvas { display: block; outline: none; }

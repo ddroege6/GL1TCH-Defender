@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover" />
+  <title>GL1TCH Defense</title>
+  <style>
+    html, body { margin:0; padding:0; background:#0b1118; height:100%; overflow:hidden; }
+    #errorOverlay {
+      position:fixed; inset:0; background:rgba(0,0,0,.65); color:#fff; font:14px/1.4 monospace;
+      padding:16px; overflow:auto; display:none; z-index:99999;
+    }
+    #errorOverlay pre { white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="errorOverlay"><strong>Runtime Error</strong><pre id="errText"></pre></div>
+
+  <!-- Phaser (use your local copy or a CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script>
+
+  <!-- Game code (order matters) -->
+  <script src="src/systems.js"></script>
+  <script src="src/BootScene.js"></script>
+  <script src="src/PlayScene.js"></script>
+  <script src="src/main.js"></script>
+
+  <script>
+    // Simple on-screen error overlay so black screens show a message
+    (function(){
+      const overlay = document.getElementById('errorOverlay');
+      const text = document.getElementById('errText');
+      function show(err){
+        overlay.style.display = 'block';
+        text.textContent = (err && (err.stack || err.message || String(err))) || 'Unknown error';
+      }
+      window.addEventListener('error', e => { show(e.error || e.message); });
+      window.addEventListener('unhandledrejection', e => { show(e.reason); });
+    })();
+  </script>
+</body>
+</html>
