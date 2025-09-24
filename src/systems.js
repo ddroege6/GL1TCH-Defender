@@ -1,269 +1,216 @@
 'use strict';
 
+/**
+ * Very small tile engine used by PlayScene.
+ * - States: 0=clean, 1=corrupt, 2=cleansed
+ * - Renders each tile as a 24x24 Image (fast enough for ~1.5k tiles)
+ * - Supports slow seeded corruption spread (BFS-like), cleansing, % metrics.
+ */
 (function () {
-  const TILE = 24;
-  const State = { CLEAN: 0, CORRUPTED: 1, CLEANSED: 2 };
 
-  // Sprite display sizes (in screen pixels). Change freely.
-  const SPRITES = { defender: 40, virus: 28 };
-
-  // ── Maze generation (connected, widened corridors + a few loops)
-  function buildConnectedMaze(cols, rows) {
-    const WALL = 1, PATH = 0;
-    if (cols % 2 === 0) cols -= 1;
-    if (rows % 2 === 0) rows -= 1;
-
-    const g = Array.from({ length: rows }, () => Array(cols).fill(WALL));
-    const inBounds = (x, y) => x > 0 && y > 0 && x < cols - 1 && y < rows - 1;
-
-    let cx = (Math.floor(Math.random() * ((cols - 1) / 2)) * 2) + 1;
-    let cy = (Math.floor(Math.random() * ((rows - 1) / 2)) * 2) + 1;
-
-    const stack = [[cx, cy]];
-    g[cy][cx] = PATH;
-    const dirs = [[2,0],[-2,0],[0,2],[0,-2]];
-
-    while (stack.length) {
-      const [x, y] = stack[stack.length - 1];
-      Phaser.Utils.Array.Shuffle(dirs);
-      let carved = false;
-      for (const [dx, dy] of dirs) {
-        const nx = x + dx, ny = y + dy;
-        if (!inBounds(nx, ny)) continue;
-        if (g[ny][nx] === WALL) {
-          g[y + dy / 2][x + dx / 2] = PATH;
-          g[ny][nx] = PATH;
-          stack.push([nx, ny]);
-          carved = true;
-          break;
-        }
-      }
-      if (!carved) stack.pop();
-    }
-
-    // Widen single-file passages to 2 tiles
-    for (let y = 1; y < rows - 1; y++) {
-      for (let x = 1; x < cols - 1; x++) {
-        if (g[y][x] !== PATH) continue;
-        const left=g[y][x-1]===PATH, right=g[y][x+1]===PATH, up=g[y-1][x]===PATH, down=g[y+1][x]===PATH;
-        if ((left||right) && !(up||down)) g[y-1][x] = PATH;
-        else if ((up||down) && !(left||right)) g[y][x-1] = PATH;
-      }
-    }
-
-    // Add some loops
-    const openings = Math.floor((cols * rows) / 120);
-    for (let i = 0; i < openings; i++) {
-      const rx = Phaser.Math.Between(2, cols - 3);
-      const ry = Phaser.Math.Between(2, rows - 3);
-      const n =
-        (g[ry][rx - 1] === PATH) + (g[ry][rx + 1] === PATH) +
-        (g[ry - 1][rx] === PATH) + (g[ry + 1][rx] === PATH);
-      if (g[ry][rx] === WALL && n >= 2) g[ry][rx] = PATH;
-    }
-
-    return { WALL, PATH, grid: g, cols, rows };
-  }
-
-  // Helper to force-fit any PNG to our tile size
-  function fitToTile(go) { go.setDisplaySize(TILE, TILE).setOrigin(0, 0); }
+  const STATE = { CLEAN: 0, CORRUPT: 1, CLEANSED: 2 };
 
   class Grid {
-    constructor(scene) {
+    /**
+     * @param {Phaser.Scene} scene
+     * @param {{tileSize:number, textures:{clean:string,corrupt:string,cleansed:string}, depthFloor?:number, depthOverlay?:number}} opts
+     */
+    constructor(scene, opts) {
       this.scene = scene;
-      this.originX = 0;
-      this.originY = 0;
-      this.cols = 0;
-      this.rows = 0;
+      this.size = opts.tileSize;
+      this.tex = opts.textures;
+      this.depthFloor = opts.depthFloor ?? -10;
+      this.depthOverlay = opts.depthOverlay ?? -3;
 
-      this.WALL = 1;
-      this.PATH = 0;
-      this.maze = null;
+      const W = scene.scale.gameSize.width;
+      const H = scene.scale.gameSize.height;
 
-      this.pathStates = null; // CLEAN/CORRUPTED/CLEANSED for path tiles
-      this.tiles = [];        // {x,y,img}
-      this.walls = null;      // static physics group
+      this.cols = Math.floor(W / this.size);
+      this.rows = Math.floor(H / this.size);
 
-      this.regenerate();
+      // tile state & sprites
+      this.state = new Array(this.rows * this.cols).fill(STATE.CLEAN);
+      this.sprites = new Array(this.rows * this.cols);
+
+      // corruption bookkeeping
+      this.corruptCount = 0;
+      this.seeds = [];   // { frontier:Set<number> }
+      this._buildSprites();
     }
 
-    destroy() {
-      if (this.walls) { this.walls.clear(true, true); this.walls.destroy(); this.walls = null; }
-      for (const t of this.tiles) { try { t.img.destroy(); } catch {} }
-      this.tiles.length = 0;
-    }
+    // --------------- construction / helpers ----------------
+    _idx(c, r) { return r * this.cols + c; }
+    _inBounds(c, r) { return c >= 0 && r >= 0 && c < this.cols && r < this.rows; }
+    _tileCenterX(c) { return c * this.size + this.size / 2; }
+    _tileCenterY(r) { return r * this.size + this.size / 2; }
 
-    regenerate() {
-      this.destroy();
+    _buildSprites() {
+      const s = this.size;
+      const add = (c, r, tex) => {
+        const img = this.scene.add.image(this._tileCenterX(c), this._tileCenterY(r), tex)
+          .setOrigin(0.5).setDepth(this.depthFloor).setDisplaySize(s, s).setAlpha(1);
+        return img;
+      };
 
-      const W = this.scene.scale.gameSize.width;
-      const H = this.scene.scale.gameSize.height;
-
-      this.cols = Math.floor(W / TILE);
-      this.rows = Math.floor(H / TILE);
-
-      const { WALL, PATH, grid, cols, rows } = buildConnectedMaze(this.cols, this.rows);
-      this.WALL = WALL; this.PATH = PATH;
-      this.maze = grid; this.cols = cols; this.rows = rows;
-
-      this.originX = Math.floor((W - this.cols * TILE) / 2);
-      this.originY = Math.floor((H - this.rows * TILE) / 2);
-
-      this.walls = this.scene.physics.add.staticGroup();
-      this.pathStates = Array.from({ length: this.rows }, () => Array(this.cols).fill(State.CLEAN));
-
-      for (let y = 0; y < this.rows; y++) {
-        for (let x = 0; x < this.cols; x++) {
-          const wx = this.originX + x * TILE;
-          const wy = this.originY + y * TILE;
-
-          if (this.maze[y][x] === WALL) {
-            const wall = this.walls.create(wx, wy, 'tileWall').setOrigin(0, 0);
-            wall.setDisplaySize(TILE, TILE);
-            wall.refreshBody();
-          } else {
-            const img = this.scene.add.image(wx, wy, 'tilePathClean');
-            fitToTile(img);
-            this.tiles.push({ x, y, img });
-          }
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          const i = this._idx(c, r);
+          this.sprites[i] = add(c, r, this.tex.clean);
         }
       }
-      this.walls.refresh();
     }
 
-    inBounds(x, y) { return x >= 0 && y >= 0 && x < this.cols && y < this.rows; }
-    isPath(x, y)   { return this.inBounds(x, y) && this.maze[y][x] === this.PATH; }
+    _setState(c, r, newState) {
+      if (!this._inBounds(c, r)) return false;
+      const i = this._idx(c, r);
+      const old = this.state[i];
+      if (old === newState) return false;
 
-    setState(x, y, val) {
-      if (!this.isPath(x, y)) return;
-      this.pathStates[y][x] = val;
-      const tile = this.tiles.find(t => t.x === x && t.y === y);
-      if (!tile) return;
-      const img = tile.img;
-      if (val === State.CLEAN)         img.setTexture('tilePathClean');
-      else if (val === State.CORRUPTED) img.setTexture('tilePathCorrupt');
-      else                              img.setTexture('tilePathCleansed');
+      this.state[i] = newState;
+      if (old === STATE.CORRUPT && newState !== STATE.CORRUPT) this.corruptCount--;
+      if (old !== STATE.CORRUPT && newState === STATE.CORRUPT) this.corruptCount++;
+
+      const img = this.sprites[i];
+      const tex =
+        newState === STATE.CLEAN    ? this.tex.clean :
+        newState === STATE.CORRUPT  ? this.tex.corrupt :
+                                      this.tex.cleansed;
+      img.setTexture(tex);
+      return true;
     }
 
-    getState(x, y) { return this.isPath(x, y) ? this.pathStates[y][x] : null; }
-
-    tileAtWorld(x, y) {
-      const tx = Math.floor((x - this.originX) / TILE);
-      const ty = Math.floor((y - this.originY) / TILE);
-      return { tx, ty, valid: this.isPath(tx, ty) };
-    }
-
-    randomEdgeSpawn(count = 2) {
-      const cands = [];
-      for (let y = 1; y < this.rows - 1; y++) {
-        for (let x = 1; x < this.cols - 1; x++) {
-          const edge = (x === 1 || y === 1 || x === this.cols - 2 || y === this.rows - 2);
-          if (edge && this.isPath(x, y)) cands.push([x, y]);
-        }
-      }
-      Phaser.Utils.Array.Shuffle(cands);
-      for (let i = 0; i < count && i < cands.length; i++) {
-        const [x, y] = cands[i];
-        this.setState(x, y, State.CORRUPTED);
-      }
-    }
-
-    spread(chance = 0.2) {
-      const toCorrupt = [];
-      for (let y = 0; y < this.rows; y++) {
-        for (let x = 0; x < this.cols; x++) {
-          if (this.getState(x, y) === State.CORRUPTED) {
-            for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
-              const nx = x + dx, ny = y + dy;
-              if (!this.isPath(nx, ny)) continue;
-              if (this.getState(nx, ny) === State.CLEAN && Math.random() < chance) toCorrupt.push([nx, ny]);
-            }
-          }
-        }
-      }
-      for (const [cx, cy] of toCorrupt) this.setState(cx, cy, State.CORRUPTED);
-    }
-
-    cleanseCircle(cx, cy, radius, maxPerTick = 8) {
+    _forEachInCircle(x, y, radius, fn) {
+      const s = this.size;
+      const c0 = Math.max(0, Math.floor((x - radius) / s));
+      const r0 = Math.max(0, Math.floor((y - radius) / s));
+      const c1 = Math.min(this.cols - 1, Math.floor((x + radius) / s));
+      const r1 = Math.min(this.rows - 1, Math.floor((y + radius) / s));
       const r2 = radius * radius;
-      let changed = 0;
-      for (let y = 0; y < this.rows; y++) {
-        for (let x = 0; x < this.cols; x++) {
-          if (this.getState(x, y) !== State.CORRUPTED) continue;
-          const px = this.originX + x * TILE + TILE / 2;
-          const py = this.originY + y * TILE + TILE / 2;
-          const dx = px - cx, dy = py - cy;
-          if (dx * dx + dy * dy <= r2) {
-            this.setState(x, y, State.CLEAN);
-            if (++changed >= maxPerTick) return changed;
+
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const dx = this._tileCenterX(c) - x;
+          const dy = this._tileCenterY(r) - y;
+          if (dx * dx + dy * dy <= r2) fn(c, r);
+        }
+      }
+    }
+
+    // --------------- public API ----------------
+
+    regenerate({ initialBlobs = 2 } = {}) {
+      // reset
+      this.state.fill(STATE.CLEAN);
+      this.corruptCount = 0;
+      this.seeds.length = 0;
+      for (let i = 0; i < this.sprites.length; i++) {
+        this.sprites[i].setTexture(this.tex.clean);
+      }
+
+      // create initial seeds (1-2 tiles) near edges to feel like ingress points
+      for (let s = 0; s < initialBlobs; s++) {
+        const edge = Phaser.Math.Between(0, 3);
+        const c = edge === 0 ? 1 : edge === 1 ? this.cols - 2 : Phaser.Math.Between(2, this.cols - 3);
+        const r = edge === 2 ? 1 : edge === 3 ? this.rows - 2 : Phaser.Math.Between(2, this.rows - 3);
+
+        const front = new Set();
+        const i0 = this._idx(c, r);
+        front.add(i0);
+        this._setState(c, r, STATE.CORRUPT);
+        this.seeds.push({ frontier: front });
+      }
+    }
+
+    /** Percent of corrupt tiles rounded to integer */
+    percentCorrupt() {
+      const total = this.cols * this.rows;
+      return Math.min(100, Math.round((this.corruptCount / total) * 100));
+    }
+
+    /**
+     * Slowly expands each seed 1 step at a time. Called by a timer in PlayScene.
+     * @param {number} stepsPerSeed - tiles to corrupt per seed per tick (default 1..2)
+     * @param {number} maxBudget    - hard cap tiles to corrupt this tick (keeps frame time consistent)
+     * @param {number} chanceNewSeed- 0..1 probability to add a fresh ingress near edges
+     */
+    slowSpreadTick(stepsPerSeed = 1, maxBudget = 18, chanceNewSeed = 0.06) {
+      let budget = maxBudget;
+
+      const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (const seed of this.seeds) {
+        let corruptThisSeed = 0;
+
+        // snapshot of current frontier
+        const candidates = Array.from(seed.frontier.values());
+        if (candidates.length === 0) continue;
+
+        // expand from a random subset of frontier
+        Phaser.Utils.Array.Shuffle(candidates);
+        for (let idx = 0; idx < candidates.length && corruptThisSeed < stepsPerSeed && budget > 0; idx++) {
+          const i = candidates[idx];
+          const c = i % this.cols;
+          const r = (i / this.cols) | 0;
+
+          // try 4-neighbors
+          Phaser.Utils.Array.Shuffle(dirs);
+          for (const [dc, dr] of dirs) {
+            const nc = c + dc, nr = r + dr;
+            if (!this._inBounds(nc, nr)) continue;
+            const ni = this._idx(nc, nr);
+            if (this.state[ni] !== STATE.CLEAN) continue;
+
+            // corrupt neighbor
+            this._setState(nc, nr, STATE.CORRUPT);
+            seed.frontier.add(ni);
+            corruptThisSeed++;
+            budget--;
+            if (budget <= 0 || corruptThisSeed >= stepsPerSeed) break;
           }
         }
       }
-      return changed;
-    }
 
-    corruptedRatio() {
-      let c = 0, tot = 0;
-      for (let y = 0; y < this.rows; y++) {
-        for (let x = 0; x < this.cols; x++) {
-          if (!this.isPath(x, y)) continue;
-          tot++;
-          if (this.getState(x, y) === State.CORRUPTED) c++;
-        }
+      // occasionally add a new ingress near edges to keep late-game pressure up
+      if (Math.random() < chanceNewSeed) {
+        const edge = Phaser.Math.Between(0, 3);
+        const c = edge === 0 ? 1 : edge === 1 ? this.cols - 2 : Phaser.Math.Between(2, this.cols - 3);
+        const r = edge === 2 ? 1 : edge === 3 ? this.rows - 2 : Phaser.Math.Between(2, this.rows - 3);
+        const front = new Set([this._idx(c, r)]);
+        this._setState(c, r, STATE.CORRUPT);
+        this.seeds.push({ frontier: front });
       }
-      return tot > 0 ? (c / tot) : 0;
     }
 
-    corruptedTiles() {
-      const arr = [];
-      for (let y = 0; y < this.rows; y++)
-        for (let x = 0; x < this.cols; x++)
-          if (this.getState(x, y) === State.CORRUPTED) arr.push([x, y]);
-      return arr;
+    /**
+     * Cleanses a circular area. Returns number of corrupt tiles cleansed.
+     */
+    cleanseAt(x, y, radius) {
+      let cleaned = 0;
+      this._forEachInCircle(x, y, radius, (c, r) => {
+        const i = this._idx(c, r);
+        if (this.state[i] === STATE.CORRUPT) {
+          this._setState(c, r, STATE.CLEANSED);
+          cleaned++;
+        }
+      });
+      return cleaned;
+    }
+
+    /** Utility used by older code paths; not used by PlayScene now. */
+    spawnCorruptionBlobs(count = 1, minTiles = 1, maxTiles = 2) {
+      for (let k = 0; k < count; k++) {
+        const c0 = Phaser.Math.Between(1, this.cols - 2);
+        const r0 = Phaser.Math.Between(1, this.rows - 2);
+        const tiles = Phaser.Math.Between(minTiles, maxTiles);
+        const front = new Set([this._idx(c0, r0)]);
+        this._setState(c0, r0, STATE.CORRUPT);
+        this.seeds.push({ frontier: front });
+
+        // prime a tiny patch
+        for (let t = 0; t < tiles; t++) this.slowSpreadTick(1, 1, 0);
+      }
     }
   }
 
-  function spawnEnemy(scene, grid, speed = 85) {
-    const choices = grid.corruptedTiles();
-    if (choices.length === 0) return null;
-
-    const [tx, ty] = Phaser.Utils.Array.GetRandom(choices);
-    const wx = grid.originX + tx * TILE + TILE / 2;
-    const wy = grid.originY + ty * TILE + TILE / 2;
-
-    const e = scene.physics.add.image(wx, wy, 'virusTex')
-      .setDepth(5)
-      .setCollideWorldBounds(true);
-
-    // Force display size (independent of PNG pixels)
-    e.setDisplaySize(SPRITES.virus, SPRITES.virus);
-
-    // Physics body: circle centered inside the display size
-    const r = Math.floor(SPRITES.virus / 2) - 2;
-    const off = (SPRITES.virus / 2 - r);
-    e.body.setCircle(r, off, off);
-
-    e.setData('speed', speed);
-    e.setData('alive', true);
-
-    scene.enemies.add(e);
-    scene.physics.add.collider(e, grid.walls);
-    return e;
-  }
-
-  function updateEnemies(scene, player) {
-    scene.enemies.children.iterate((e) => {
-      if (!e || !e.getData('alive')) return;
-      const spd = e.getData('speed');
-      const v = new Phaser.Math.Vector2(player.x - e.x, player.y - e.y);
-      if (v.lengthSq() > 1e-3) v.normalize().scale(spd);
-      e.setVelocity(v.x, v.y);
-    });
-  }
-
-  window.GD_CONST = { TILE, State };
-  window.GD_SPRITES = SPRITES;
   window.Grid = Grid;
-  window.spawnEnemy = spawnEnemy;
-  window.updateEnemies = updateEnemies;
+
 })();

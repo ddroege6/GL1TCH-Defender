@@ -45,3 +45,6 @@ Corruption spreads across a synthetic grid while glitch-viruses hunt you. **Blin
 - Every **5 waves**, the “motherboard” layout reconfigures to keep runs fresh.
 
 ---
+
+## Play Online
+- https://ddroege6.github.io/GL1TCH-Defender/

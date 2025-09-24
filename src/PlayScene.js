@@ -1,434 +1,405 @@
 'use strict';
 
 (function () {
+
+  // ----------------------------- Tunables -----------------------------
+  const TILE = 24;
+
+  const ARENA_PADDING = 8;
+  const WAVE_DURATION_S = 50;
+
+  // racks layout (2x12 tiles each), 6 columns top and 6 bottom
+  const RACK_W_TILES = 2;
+  const RACK_H_TILES = 12;
+  const TOP_ROW_Y_F = 0.28;
+  const BOT_ROW_Y_F = 0.68;
+  const SIDE_MARGIN_F = 0.08;
+  const EXTRA_AISLE_F = 0.04;
+
+  // dispersion pacing (slower & smoother than before)
+  const DISP_CURVE_DECAY = 0.985;     // higher = slower growth
+  const DISP_PER_WAVE_MIN = 2;        // minimum pieces per wave
+  const DISP_TWEEN_MS = 650;
+
+  // corruption cadence (seeded, tile-by-tile)
+  const SPREAD_TICK_MS = 750;
+
+  // player/enemy
+  const PLAYER_DISPLAY = 36;
+  const PLAYER_BODY_W = 16;
+  const PLAYER_BODY_H = 20;
+  const PLAYER_SPEED  = 180;
+
+  const ENEMY_DISPLAY = 26;
+  const ENEMY_BODY_W  = 14;
+  const ENEMY_BODY_H  = 16;
+  const ENEMY_SPEED   = 95;
+
+  const CLEANSE_RADIUS  = 58;
+  const CLEANSE_RATE_MS = 120;
+
   class PlayScene extends Phaser.Scene {
-    constructor() {
-      super('PlayScene');
+    constructor() { super('Play'); }
 
-      // Wave/difficulty (Wave 1 applied in create)
+    init() {
       this.wave = 1;
-      this.waveTime = 60;
-      this.corruptTickMs = 1200;
-      this.corruptChance = 0.12;
-      this.enemyIntervalMs = 2800;
-      this.enemySpeed = 70;
-      this.maxEnemies = 8;
+      this.securedCount = 0;
+      this.dead = false;
+      this.waveEndsAt = this.time.now + WAVE_DURATION_S * 1000;
 
-      // Abilities
-      this.blinkCooldownMs = 2000;
-      this.blinkDistance  = 120;
-      this.blinkInvulnMs  = 250;
-      this.cleanseRadius  = 82;
+      this.rackTiles = [];
+      this.initialRackCount = 0;
+      this.cumulativeDispersed = 0;
 
-      // runtime
-      this.timers = [];
-      this.gameOver = false;
-      this.blinkReadyAt = 0;
-      this.invulnUntil = 0;
-
-      // UI
-      this.hud = null;
-      this.blinkMeter = null;
-      this.blinkLabel = null;
-      this._blinkWasReady = true;
-
-      // Scoring/flow
-      this.score = 0;
-      this._noCorruptSince = null;
-
-      // Input state
-      this.keys = null;
-      this.pad  = null;
-      this.cleanseHeldEvt = false; // keyboard/gamepad hold flag
-
-      // Pointer Tap/Hold
-      this.pointerHold = false;
-      this.pointerDownAt = 0;
-      this.pointerHoldTimer = null;
-      this.TAP_MS = 250; // < TAP_MS => blink, >= TAP_MS => cleanse while held
-
-      // Cleanup stack
-      this._cleanupFns = [];
+      this.isCleansing = false;
+      this.nextCleanseAt = 0;
+      this.sceneStartTime = this.time.now;
     }
 
-    // ───────────────────────────────────────────────────────────────────────────
-    // Difficulty curve
-    _applyWaveTuning(wave) {
-      const clamp = Phaser.Math.Clamp;
-      const ease  = Phaser.Math.Easing.Quadratic.InOut;
-      const t = clamp((wave - 1) / 9, 0, 1);
-
-      this.corruptTickMs   = Math.round(Phaser.Math.Linear(1200, 520,  ease(t)));
-      this.corruptChance   = Phaser.Math.Linear(0.12, 0.28, t);
-      this.enemyIntervalMs = Math.round(Phaser.Math.Linear(2800, 1000, ease(t)));
-      this.enemySpeed      = Math.round(Phaser.Math.Linear(70,   140,  t));
-      this.maxEnemies      = Math.round(Phaser.Math.Linear(8,    22,   t));
-      this.cleanseRadius   = Math.round(Phaser.Math.Linear(82,   68,   t));
-      this.blinkCooldownMs = 2000;
-      this.waveTime        = Math.round(Phaser.Math.Linear(60,   45,   t));
-    }
-
-    // ───────────────────────────────────────────────────────────────────────────
-    // Blink UI helpers
-    _getBlinkProgress() {
-      const now = this.time.now || 0;
-      if (!this.blinkReadyAt) return 1;
-      const remaining = this.blinkReadyAt - now;
-      return Phaser.Math.Clamp(1 - remaining / this.blinkCooldownMs, 0, 1);
-    }
-    _blinkUIPos() {
-      const W = this.scale.gameSize.width;
-      return { x: W - 52, y: 52 };
-    }
-    _renderBlinkUI() {
-      if (!this.blinkMeter) return;
-      const { x, y } = this._blinkUIPos();
-      const g = this.blinkMeter; g.clear();
-      const R_OUT = 30, R_IN = 22;
-      const ready = (this.time.now >= (this.blinkReadyAt || 0));
-      const p = this._getBlinkProgress();
-
-      g.fillStyle(0x1f2937, 0.6); g.slice(x,y,R_OUT,-Math.PI,Math.PI,true); g.fill();
-      g.fillStyle(0x0b0f14, 1);   g.slice(x,y,R_IN,-Math.PI,Math.PI,true); g.fill();
-
-      if (p > 0) {
-        const start = -Math.PI/2, end = start + p * Math.PI * 2;
-        g.fillStyle(ready ? 0x22d3ee : 0x94a3b8, 0.95);
-        g.beginPath(); g.moveTo(x,y); g.arc(x,y,R_OUT,start,end,false); g.lineTo(x,y); g.closePath(); g.fill();
-        g.fillStyle(0x0b0f14, 1); g.slice(x,y,R_IN,-Math.PI,Math.PI,true); g.fill();
-      }
-      if (this.blinkLabel) {
-        this.blinkLabel.setPosition(x, y - R_OUT - 14);
-        this.blinkLabel.setColor(ready ? '#22d3ee' : '#9ab3c9');
-        this.blinkLabel.setText(ready ? 'BLINK READY' : 'BLINK…');
-      }
-    }
-
-    // Wave helpers
-    _seedsForWave(w) { return Math.min(6, 2 + Math.floor((w - 1) / 2)); }
-    _ensureCorruption(minSeeds = 1) { if (this.grid.corruptedTiles().length < minSeeds) this.grid.randomEdgeSpawn(minSeeds); }
-
-    // Map rebuild (called on create and every 5 waves)
-    _rebuildMap() {
-      this.grid.regenerate();
-      // Rebind player and enemies to the new static walls
-      this.physics.world.colliders.destroy(); // clear previous colliders
-      this.physics.add.collider(this.player, this.grid.walls);
-      this.enemies.children.iterate(e => { if (e) this.physics.add.collider(e, this.grid.walls); });
-      this.physics.add.overlap(this.player, this.enemies, () => {
-        if (this.time.now < this.invulnUntil) return;
-        this._gameOver();
-      });
-    }
-
-    // ───────────────────────────────────────────────────────────────────────────
     create() {
-      // Reset runtime flags on fresh start
-      this.gameOver = false;
-      this.cleanseHeldEvt = false;
-      this.pointerHold = false;
-      this.pointerDownAt = 0;
-      if (this.pointerHoldTimer) { this.pointerHoldTimer.remove(false); this.pointerHoldTimer = null; }
-      this._cleanupFns.length = 0;
+      const { width: W, height: H } = this.scale.gameSize;
+      this.physics.world.setBounds(0, 0, W, H);
 
-      const W = this.scale.gameSize.width, H = this.scale.gameSize.height;
+      // ----- grid with seeded spread -----
+      this.grid = new window.Grid(this, {
+        tileSize: TILE,
+        textures: {
+          clean:    'tile_path_clean',
+          corrupt:  'tile_path_corrupt',
+          cleansed: 'tile_path_cleansed',
+        },
+        depthFloor: -10,
+        depthOverlay: -3,
+      });
+      this.grid.regenerate({ initialBlobs: 2 });
 
-      // Grid
-      this.grid = new window.Grid(this);
-
-      // Difficulty
-      this._applyWaveTuning(1);
-
-      // Player (force display size & physics body, independent of PNG pixels)
-      const dSize = window.GD_SPRITES.defender;
-      this.player = this.physics.add.image(W * 0.5, H * 0.5, 'defenderTex')
-        .setDepth(10)
-        .setCollideWorldBounds(true);
-      this.player.setDisplaySize(dSize, dSize);
-      {
-        const r = Math.floor(dSize / 2) - 2;
-        const off = (dSize / 2 - r);
-        this.player.body.setCircle(r, off, off);
-      }
-      this.player.setDrag(650, 650).setMaxVelocity(220, 220);
-
-      // Enemies group
-      this.enemies = this.add.group();
-
-      // Colliders
-      this.physics.add.collider(this.player, this.grid.walls);
-
-      // HUD + Blink UI
-      this.hud = this.add.text(12, 8, '', { fontFamily: 'monospace', fontSize: 16, color: '#9ad9ff' })
-        .setScrollFactor(0).setDepth(20);
-      this.blinkMeter = this.add.graphics().setDepth(26).setScrollFactor(0);
-      this.blinkLabel = this.add.text(0, 0, 'BLINK…', { fontFamily: 'monospace', fontSize: 12, color: '#9ab3c9' })
-        .setDepth(27).setScrollFactor(0).setOrigin(0.5);
-      this._renderBlinkUI();
-
-      // Initial corruption + timers
-      this.grid.randomEdgeSpawn(this._seedsForWave(1));
-      this._resetTimers();
-
-      // Lose condition (overlap)
-      this.physics.add.overlap(this.player, this.enemies, () => {
-        if (this.time.now < this.invulnUntil) return;
-        this._gameOver();
+      // spread timer (tile-by-tile from seeds)
+      this.spreadTimer = this.time.addEvent({
+        delay: SPREAD_TICK_MS, loop: true,
+        callback: () => {
+          // slightly scale with wave for pressure
+          const steps = 1 + Math.floor(this.wave / 3);
+          const budget = 8 + this.wave * 2;
+          this.grid.slowSpreadTick(steps, budget, 0.05);
+        }
       });
 
-      // INPUT
+      // ----- racks -----
+      this._buildRacks();
+
+      // ----- player -----
+      this.player = this.physics.add.image(W * 0.50, H * 0.50, 'defender')
+        .setDepth(5).setOrigin(0.5).setDisplaySize(PLAYER_DISPLAY, PLAYER_DISPLAY)
+        .setCollideWorldBounds(true);
+      this.player.body.setSize(PLAYER_BODY_W, PLAYER_BODY_H, true);
+
+      // ----- input -----
       this._setupInput();
 
-      // Clean up listeners/timers on scene shutdown/destroy
-      this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this._cleanup());
-      this.events.once(Phaser.Scenes.Events.DESTROY, () => this._cleanup());
+      // ----- enemies -----
+      this.enemies = this.physics.add.group();
+      this._topUpEnemies(true);
+      this.enemyTopUpTimer = this.time.addEvent({
+        delay: 1800, loop: true, callback: () => this._topUpEnemies(false),
+      });
+
+      // debris (dynamic while tweening)
+      this.debrisDynamic = this.physics.add.group({ allowGravity: false });
+      this.physics.add.collider(this.player,  this.debrisDynamic);
+      this.physics.add.collider(this.enemies, this.debrisDynamic);
+
+      // collisions
+      this.physics.add.collider(this.player,  this.rackGroup);
+      this.physics.add.collider(this.enemies, this.rackGroup);
+      this.physics.add.overlap (this.player,  this.enemies, this._onPlayerHit, null, this);
+      this.physics.add.collider(this.player,  this.enemies, this._onPlayerHit, null, this);
+
+      // HUD + cleanse ring
+      this._buildHud();
+      this.cleanseGfx = this.add.graphics().setDepth(6).setScrollFactor(0).setBlendMode(Phaser.BlendModes.ADD).setAlpha(0).setVisible(false);
+
+      this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+        this.enemyTopUpTimer?.destroy();
+        this.spreadTimer?.destroy();
+        this.tweens.killAll();
+      });
     }
 
+    // --------------------------- layout ---------------------------
+    _buildRacks() {
+      const { width: W, height: H } = this.scale.gameSize;
+
+      this.rackGroup = this.physics.add.staticGroup();
+      this.rackTiles.length = 0;
+
+      const tex = this.textures.exists('rack_tile') ? 'rack_tile' : 'tile_path_clean';
+      const tint= this.textures.exists('rack_tile') ? 0xffffff : 0x16384e;
+
+      const spawnColumn = (cx, cy) => {
+        const rackW = RACK_W_TILES * TILE;
+        const rackH = RACK_H_TILES * TILE;
+        const x0 = Math.round(cx - rackW / 2);
+        const y0 = Math.round(cy - rackH / 2);
+
+        for (let ty = 0; ty < RACK_H_TILES; ty++) {
+          for (let tx = 0; tx < RACK_W_TILES; tx++) {
+            const x = x0 + tx * TILE + TILE / 2;
+            const y = y0 + ty * TILE + TILE / 2;
+            const s = this.physics.add.staticImage(x, y, tex)
+              .setOrigin(0.5).setDisplaySize(TILE, TILE).setDepth(2).setTint(tint).setAlpha(0.98);
+            s.refreshBody();                // make static body exactly 24x24
+            this.rackGroup.add(s);
+            this.rackTiles.push(s);
+          }
+        }
+      };
+
+      const xs = (() => {
+        const left  = W * SIDE_MARGIN_F;
+        const right = W * (1 - SIDE_MARGIN_F);
+        const usable = right - left;
+        const spacing = usable / 7; // 6 cols -> 7 gaps
+        const out = [];
+        for (let i = 1; i <= 6; i++) out.push(left + i * spacing + (i - 3.5) * (W * EXTRA_AISLE_F / 6));
+        return out;
+      })();
+
+      xs.forEach(x => spawnColumn(x, H * TOP_ROW_Y_F));
+      xs.forEach(x => spawnColumn(x, H * BOT_ROW_Y_F));
+
+      this.initialRackCount = this.rackTiles.length;
+      this.cumulativeDispersed = 0;
+    }
+
+    // --------------------------- input ---------------------------
     _setupInput() {
-      const K = Phaser.Input.Keyboard.KeyCodes;
+      this.cursors = this.input.keyboard.createCursorKeys();
+      this.keyW    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W);
+      this.keyA    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
+      this.keyS    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S);
+      this.keyD    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D);
+      this.keyE    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
+      this.keySHIFT= this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT);
+      this.keySPACE= this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
 
-      this.keys = this.input.keyboard.addKeys({
-        up: K.UP, down: K.DOWN, left: K.LEFT, right: K.RIGHT,
-        W: K.W, A: K.A, S: K.S, D: K.D,
-        BLINK: K.SPACE, CLEANSE: K.SHIFT, CLEANSE2: K.E
-      });
+      this.input.on('pointerdown', () => this._startCleansing());
+      this.input.on('pointerup',   () => this._stopCleansing());
+      this.keyE.on('down',         () => this._startCleansing());
+      this.keyE.on('up',           () => this._stopCleansing());
+      this.keySHIFT.on('down',     () => this._startCleansing());
+      this.keySHIFT.on('up',       () => this._stopCleansing());
+    }
 
-      // Prevent browser from stealing SPACE/SHIFT
-      this.input.keyboard.addCapture([K.SPACE, K.SHIFT]);
+    // --------------------------- HUD ---------------------------
+    _buildHud() {
+      this.hud = {};
+      this.hud.text = this.add.text(12, 8, '', {
+        fontFamily: 'monospace', fontSize: '18px', color: '#a7e8ff'
+      }).setDepth(50).setScrollFactor(0);
 
-      // Blink (Space)
-      const onBlink = () => this._tryBlink();
-      this.keys.BLINK.on('down', onBlink, this);
-      this._cleanupFns.push(() => this.keys.BLINK.off('down', onBlink, this));
+      this.blinkReadyAt = 0;
+      this.blinkCooldownMs = 1400;
+      this.hudRing = this.add.graphics().setDepth(50).setScrollFactor(0);
+      this._drawBlinkRing(1);
+    }
+    _drawBlinkRing(alpha) {
+      const { width: W } = this.scale.gameSize;
+      const x = W - 42, y = 40, r = 20;
+      const g = this.hudRing;
+      g.clear();
+      g.lineStyle(4, 0x61dafb, 0.85);
+      g.strokeCircle(x, y, r);
+      g.beginPath();
+      g.arc(x, y, r, -Math.PI/2, -Math.PI/2 + Math.PI*2*alpha, false);
+      g.strokePath();
+      g.closePath();
+    }
 
-      // Cleanse (hold Shift or E)
-      const onCleanseDown = () => { this.cleanseHeldEvt = true; };
-      const onCleanseUp   = () => { this.cleanseHeldEvt = false; };
-      this.keys.CLEANSE.on('down', onCleanseDown, this);
-      this.keys.CLEANSE.on('up',   onCleanseUp,   this);
-      this.keys.CLEANSE2.on('down', onCleanseDown, this);
-      this.keys.CLEANSE2.on('up',   onCleanseUp,   this);
-      this._cleanupFns.push(() => {
-        this.keys.CLEANSE.off('down', onCleanseDown, this);
-        this.keys.CLEANSE.off('up',   onCleanseUp,   this);
-        this.keys.CLEANSE2.off('down', onCleanseDown, this);
-        this.keys.CLEANSE2.off('up',   onCleanseUp,   this);
-      });
+    // --------------------------- loop ---------------------------
+    update(time) {
+      if (this.dead) return;
 
-      // Pointer: LMB = Blink, Hold LMB ≥ TAP_MS = Cleanse, RMB = Cleanse while down
-      const onPointerDown = (p) => {
-        if (p.rightButtonDown()) { this.pointerHold = true; return; }
-        if (p.leftButtonDown() || p.pointerType === 'touch') {
-          this.pointerDownAt = this.time.now;
-          if (this.pointerHoldTimer) { this.pointerHoldTimer.remove(false); }
-          this.pointerHold = false;
-          this.pointerHoldTimer = this.time.addEvent({
-            delay: this.TAP_MS,
-            callback: () => {
-              if (this.input.activePointer && this.input.activePointer.isDown) {
-                this.pointerHold = true; // start cleansing after threshold
-              }
-            },
-            callbackScope: this
-          });
+      // movement
+      const vx = (this.keyD.isDown || this.cursors.right.isDown) - (this.keyA.isDown || this.cursors.left.isDown);
+      const vy = (this.keyS.isDown || this.cursors.down.isDown)  - (this.keyW.isDown || this.cursors.up.isDown);
+      const v  = new Phaser.Math.Vector2(vx, vy).normalize().scale(PLAYER_SPEED);
+      this.player.setVelocity(v.x, v.y);
+      if (v.x < -0.01) this.player.setFlipX(true);
+      else if (v.x > 0.01) this.player.setFlipX(false);
+
+      // blink
+      const ready = time >= this.blinkReadyAt;
+      if (Phaser.Input.Keyboard.JustDown(this.keySPACE) && ready) {
+        const dir = v.lengthSq() > 0 ? v.clone().normalize() : new Phaser.Math.Vector2(1, 0);
+        const dist = 160;
+        const nx = Phaser.Math.Clamp(this.player.x + dir.x * dist, ARENA_PADDING, this.scale.gameSize.width  - ARENA_PADDING);
+        const ny = Phaser.Math.Clamp(this.player.y + dir.y * dist, ARENA_PADDING, this.scale.gameSize.height - ARENA_PADDING);
+        this.player.setPosition(nx, ny);
+        this.player.body.reset(nx, ny);
+        this.blinkReadyAt = time + this.blinkCooldownMs;
+      }
+      const cd = Math.max(0, this.blinkReadyAt - time);
+      this._drawBlinkRing(1 - cd / this.blinkCooldownMs);
+
+      // cleanse (hold)
+      if (this.isCleansing) {
+        this._showCleanseFill(this.player.x, this.player.y);
+        if (time >= this.nextCleanseAt) {
+          const cleaned = this.grid.cleanseAt(this.player.x, this.player.y, CLEANSE_RADIUS);
+          this.securedCount += cleaned;
+          this.nextCleanseAt = time + CLEANSE_RATE_MS;
         }
-      };
-      const onPointerUp = (p) => {
-        if (this.pointerHoldTimer) { this.pointerHoldTimer.remove(false); this.pointerHoldTimer = null; }
-        if (this.pointerHold || p.rightButtonReleased()) { this.pointerHold = false; this.pointerDownAt = 0; return; }
-        const dt = this.time.now - (this.pointerDownAt || 0);
-        this.pointerDownAt = 0;
-        if (dt < this.TAP_MS) this._tryBlink();
-      };
-      this.input.on('pointerdown', onPointerDown, this);
-      this.input.on('pointerup',   onPointerUp,   this);
-      this._cleanupFns.push(() => {
-        this.input.off('pointerdown', onPointerDown, this);
-        this.input.off('pointerup',   onPointerUp,   this);
+      }
+
+      // enemy AI + facing
+      this.enemies.children.iterate((e) => {
+        if (!e || !e.active) return;
+        const dir = new Phaser.Math.Vector2(this.player.x - e.x, this.player.y - e.y).normalize();
+        e.setVelocity(dir.x * ENEMY_SPEED, dir.y * ENEMY_SPEED);
+        if (e.body.velocity.x < -0.01) e.setFlipX(true);
+        else if (e.body.velocity.x > 0.01) e.setFlipX(false);
       });
 
-      // Gamepad: A = Blink, RT/R2 = Cleanse hold
-      const onPadConnected = pad => { this.pad = pad; };
-      this.input.gamepad.once('connected', onPadConnected, this);
-      if (this.input.gamepad.total) this.pad = this.input.gamepad.pad1;
-      this._cleanupFns.push(() => this.input.gamepad.off('connected', onPadConnected, this));
-
-      const onPadDown = (pad, button, index) => {
-        if (index === 0) this._tryBlink();       // A / Cross
-        if (index === 7) this.cleanseHeldEvt = true; // RT / R2
-      };
-      const onPadUp = (pad, button, index) => {
-        if (index === 7) this.cleanseHeldEvt = false;
-      };
-      this.input.gamepad.on('down', onPadDown, this);
-      this.input.gamepad.on('up',   onPadUp,   this);
-      this._cleanupFns.push(() => {
-        this.input.gamepad.off('down', onPadDown, this);
-        this.input.gamepad.off('up',   onPadUp,   this);
-      });
-    }
-
-    _cleanup() {
-      this.timers.forEach(t => t.remove(false));
-      this.timers.length = 0;
-      this._cleanupFns.forEach(fn => { try { fn(); } catch {} });
-      this._cleanupFns.length = 0;
-      this.cleanseHeldEvt = false;
-      this.pointerHold = false;
-      if (this.pointerHoldTimer) { this.pointerHoldTimer.remove(false); this.pointerHoldTimer = null; }
-    }
-
-    _resetTimers() {
-      this.timers.forEach(t => t.remove(false));
-      this.timers = [];
-      this._setTimer(() => this.grid.spread(this.corruptChance), this.corruptTickMs, true);
-      this._setTimer(() => { if (this.enemies.getLength() < this.maxEnemies) window.spawnEnemy(this, this.grid, this.enemySpeed); }, this.enemyIntervalMs, true);
-      this._setTimer(() => this._tickWaveTimer(), 1000, true);
-      this._setTimer(() => { if (this.grid.corruptedTiles().length === 0 && !this.gameOver) this.grid.randomEdgeSpawn(1); }, 4000, true); // watchdog
-    }
-    _setTimer(fn, delay, loop=false){ this.timers.push(this.time.addEvent({ delay, callback: fn, callbackScope: this, loop })); }
-
-    _tickWaveTimer() { if (!this.gameOver && --this.waveTime <= 0) this._nextWave(); }
-
-    _nextWave() {
-      this.wave++;
-      if ((this.wave - 1) % 5 === 0) { // reconfigure map
-        this._flashBanner('RECONFIGURING GRID…');
-        this.enemies.clear(true, true);
-        this._rebuildMap();
-      }
-      this._applyWaveTuning(this.wave);
-      this._resetTimers();
-      this.grid.randomEdgeSpawn(this._seedsForWave(this.wave)); // always seed a new wave
-      this._flashBanner(`WAVE ${this.wave}`);
-    }
-
-    _flashBanner(text) {
-      const W = this.scale.gameSize.width;
-      const banner = this.add.text(W / 2, 70, text, { fontFamily: 'monospace', fontSize: 28, color: '#a6f1ff' })
-        .setOrigin(0.5).setDepth(30);
-      this.tweens.add({ targets: banner, alpha: { from: 1, to: 0 }, duration: 1300, onComplete: () => banner.destroy() });
-    }
-
-    _gameOver() {
-      if (this.gameOver) return;
-      this.gameOver = true;
-
-      this._cleanup();
-      this.enemies.clear(true, true);
-
-      const W = this.scale.gameSize.width, H = this.scale.gameSize.height;
-      const dim = this.add.rectangle(W / 2, H / 2, W, H, 0x000000, 0.55).setDepth(40);
-      const msg = this.add.text(W / 2, H / 2 - 16, 'SYSTEM BREACH', { fontFamily: 'monospace', fontSize: 32, color: '#ff6bbf' })
-        .setOrigin(0.5).setDepth(50);
-      const sub = this.add.text(W / 2, H / 2 + 28, 'Click/Tap or press R/Space to restart', {
-        fontFamily: 'monospace', fontSize: 16, color: '#a6f1ff', align: 'center'
-      }).setOrigin(0.5).setDepth(50);
-
-      const doRestart = () => { dim.destroy(); msg.destroy(); sub.destroy(); this.scene.restart(); };
-      this.input.once('pointerdown', doRestart, this);
-      this.input.keyboard?.once('keydown-R', doRestart, this);
-      this.input.keyboard?.once('keydown-SPACE', doRestart, this);
-      this.input.gamepad?.once('down', () => doRestart(), this);
-    }
-
-    // ---- Movement helpers ----
-    _keyboardVector() {
-      const k = this.keys;
-      const x = (k.D.isDown || k.right.isDown) - (k.A.isDown || k.left.isDown);
-      const y = (k.S.isDown || k.down.isDown)  - (k.W.isDown || k.up.isDown);
-      const v = new Phaser.Math.Vector2(x, y);
-      return v.lengthSq() > 0 ? v.normalize() : v;
-    }
-    _gamepadVector() {
-      const p = this.pad;
-      if (!p) return new Phaser.Math.Vector2(0,0);
-      const v = new Phaser.Math.Vector2(p.axes.length ? p.axes[0].getValue() : 0, p.axes.length > 1 ? p.axes[1].getValue() : 0);
-      return (v.length() >= 0.1) ? v.normalize() : new Phaser.Math.Vector2(0,0);
-    }
-
-    update() {
-      if (this.gameOver) return;
-
-      // Movement
-      const vgp = this._gamepadVector();
-      const vkb = this._keyboardVector();
-      const v = (vgp.length() > 0.05 ? vgp : vkb);
-      this.player.setVelocity(v.x * 180, v.y * 180);
-
-      // Cleanse?
-      const kbHold = this.keys?.CLEANSE.isDown || this.keys?.CLEANSE2.isDown;
-      const gpHold = this.pad && (this.pad.rightTrigger > 0.2);
-      const doCleanse = this.cleanseHeldEvt || this.pointerHold || kbHold || gpHold;
-      if (doCleanse) {
-        const ring = this.add.circle(this.player.x, this.player.y, this.cleanseRadius, 0x23b58b, 0.06).setDepth(2);
-        this.tweens.add({ targets: ring, alpha: 0, duration: 160, onComplete: () => ring.destroy() });
-        this.grid.cleanseCircle(this.player.x, this.player.y, this.cleanseRadius, 12);
+      // waves
+      if (time >= this.waveEndsAt) {
+        this._onWaveEnd();
+        this.waveEndsAt = time + WAVE_DURATION_S * 1000;
       }
 
-      // Enemies
-      window.updateEnemies(this, this.player);
-
-      // HUD / lose
-      const sec = Phaser.Math.Clamp(this.waveTime, 0, 999);
-      const mm = String(Math.floor(sec / 60)).padStart(2, '0');
-      const ss = String(sec % 60).padStart(2, '0');
-      const corruptPct = Math.round(this.grid.corruptedRatio() * 100);
-      this.hud.setText(`WAVE ${this.wave} | ${mm}:${ss} | Corrupt: ${corruptPct}% | Secured: ${this.score}`);
-      if (corruptPct >= 70) this._gameOver();
-
-      // Win/flow beats
-      const corruptedNow = this.grid.corruptedTiles().length;
-      if (corruptedNow === 0) {
-        if (this._noCorruptSince == null) this._noCorruptSince = this.time.now;
-        if (this.time.now - this._noCorruptSince > 2000) {
-          this._noCorruptSince = null;
-          this.score += 1;
-          this._flashBanner('SECTOR SECURED +1');
-          this.grid.randomEdgeSpawn(this._seedsForWave(this.wave));
-        }
-      } else {
-        this._noCorruptSince = null;
-      }
-      if (corruptedNow === 0 && this.enemies.getLength() > 0) this._ensureCorruption(1);
-
-      // Blink UI + tiny flash when ready
-      const nowReady = this.time.now >= (this.blinkReadyAt || 0);
-      if (nowReady && !this._blinkWasReady) {
-        this._blinkWasReady = true;
-        const { x, y } = this._blinkUIPos();
-        const flash = this.add.circle(x, y, 18, 0x22d3ee, 0.35).setDepth(28);
-        this.tweens.add({ targets: flash, alpha: 0, scale: 2.0, duration: 220, onComplete: () => flash.destroy() });
-      } else if (!nowReady) {
-        this._blinkWasReady = false;
-      }
-      this._renderBlinkUI();
-    }
-
-    _tryBlink() {
-      if (this.time.now < this.blinkReadyAt) return;
-      const mv = this._gamepadVector().length() > 0.05 ? this._gamepadVector() : this._keyboardVector();
-      const dir = (mv.length() >= 0.1) ? mv : new Phaser.Math.Vector2(1, 0);
-      this._blink(dir);
-    }
-
-    _blink(dir) {
-      const half = window.GD_SPRITES.defender / 2;
-      const nx = this.player.x + dir.x * this.blinkDistance;
-      const ny = this.player.y + dir.y * this.blinkDistance;
-      const minX = half, minY = half;
-      const maxX = this.scale.gameSize.width  - half;
-      const maxY = this.scale.gameSize.height - half;
-
-      this.player.setPosition(
-        Phaser.Math.Clamp(nx, minX, maxX),
-        Phaser.Math.Clamp(ny, minY, maxY)
+      // HUD
+      const remain = Math.max(0, Math.ceil((this.waveEndsAt - time) / 1000));
+      this.hud.text.setText(
+        `WAVE ${this.wave} | 00:${remain.toString().padStart(2,'0')} | Corrupt: ${this.grid.percentCorrupt()}% | Secured: ${this.securedCount}`
       );
-      this.invulnUntil  = this.time.now + this.blinkInvulnMs;
-      this.blinkReadyAt = this.time.now + this.blinkCooldownMs;
+    }
 
-      const trail = this.add.circle(this.player.x, this.player.y, 14, 0xa9fff0, 0.4).setDepth(4);
-      this.tweens.add({ targets: trail, alpha: 0, scale: 1.9, duration: 220, onComplete: () => trail.destroy() });
+    // cleanse visuals
+    _startCleansing() { this.isCleansing = true;  this.nextCleanseAt = 0; }
+    _stopCleansing()  {
+      this.isCleansing = false;
+      const g = this.cleanseGfx;
+      this.tweens.killTweensOf(g);
+      this.tweens.add({ targets: g, alpha: 0, duration: 180, ease: 'Sine.easeOut', onComplete: () => { g.clear(); g.setVisible(false); }});
+    }
+    _showCleanseFill(x, y) {
+      const g = this.cleanseGfx;
+      g.clear();
+      g.fillStyle(0x61dafb, 0.18);
+      g.fillCircle(x, y, CLEANSE_RADIUS);
+      g.setAlpha(1).setVisible(true);
+    }
+
+    // enemies
+    _capForWave() { return Math.min(8 + this.wave * 2, 42); }
+    _topUpEnemies(force) {
+      const { width: W, height: H } = this.scale.gameSize;
+      const need = this._capForWave() - this.enemies.countActive(true);
+      if (!force && need <= 0) return;
+      for (let i = 0; i < Math.max(0, need); i++) {
+        const side = Phaser.Math.Between(0, 3);
+        let x, y;
+        if (side === 0) { x = -30;            y = 40 + Math.random() * (H - 80); }
+        if (side === 1) { x = W + 30;         y = 40 + Math.random() * (H - 80); }
+        if (side === 2) { x = 40 + Math.random() * (W - 80); y = -30; }
+        if (side === 3) { x = 40 + Math.random() * (W - 80); y = H + 30; }
+
+        const e = this.enemies.create(x, y, 'virus')
+          .setOrigin(0.5).setDisplaySize(ENEMY_DISPLAY, ENEMY_DISPLAY)
+          .setDepth(4).setCollideWorldBounds(true);
+        e.body.setSize(ENEMY_BODY_W, ENEMY_BODY_H, true);
+      }
+    }
+
+    // waves / rack dispersion (slower + smooth)
+    _onWaveEnd() {
+      this.wave += 1;
+
+      const delta = this._tilesToDisperseThisWave();
+      if (delta > 0) this._disperseRackTiles(delta);
+
+      this._topUpEnemies(true);
+    }
+
+    _tilesToDisperseThisWave() {
+      // cumulative target = initial * (1 - decay^wave)
+      const targetCumulative = Math.floor(this.initialRackCount * (1 - Math.pow(DISP_CURVE_DECAY, this.wave)));
+      const delta = Math.max(0, targetCumulative - this.cumulativeDispersed);
+      return Math.max(delta, (this.wave > 1 ? DISP_PER_WAVE_MIN : 0));
+    }
+
+    _disperseRackTiles(count) {
+      const { width: W, height: H } = this.scale.gameSize;
+      const pool = this.rackTiles.filter(s => s.active && s.visible);
+      if (pool.length === 0) return;
+
+      Phaser.Utils.Array.Shuffle(pool);
+      const take = Math.min(count, pool.length);
+
+      for (let i = 0; i < take; i++) {
+        const s = pool[i];
+        this.rackGroup.remove(s);
+        s.disableBody(true, true);
+
+        const tex = this.textures.exists('rack_tile') ? 'rack_tile' : 'tile_path_clean';
+        const d = this.debrisDynamic.create(s.x, s.y, tex)
+          .setOrigin(0.5).setDisplaySize(TILE, TILE).setDepth(4)
+          .setBounce(0.2).setCollideWorldBounds(true);
+
+        const pad = ARENA_PADDING + TILE;
+        const tx = Phaser.Math.Between(pad, W - pad);
+        const ty = Phaser.Math.Between(pad, H - pad);
+
+        this.tweens.add({
+          targets: d, x: tx, y: ty, duration: DISP_TWEEN_MS, ease: 'Sine.easeInOut',
+          onComplete: () => this._convertDebrisToStatic(d)
+        });
+
+        this.cumulativeDispersed += 1;
+      }
+
+      this.physics.add.collider(this.player,  this.rackGroup);
+      this.physics.add.collider(this.enemies, this.rackGroup);
+    }
+
+    _convertDebrisToStatic(dyn) {
+      const x = dyn.x, y = dyn.y;
+      const tex = dyn.texture.key;
+      this.debrisDynamic.remove(dyn, true, true);
+
+      const s = this.physics.add.staticImage(x, y, tex)
+        .setOrigin(0.5).setDisplaySize(TILE, TILE).setDepth(2).setAlpha(0.98);
+      s.refreshBody();
+      this.rackGroup.add(s);
+      this.rackTiles.push(s);
+    }
+
+    // death + score save
+    _onPlayerHit() {
+      if (this.dead) return;
+      this.dead = true;
+      this.player.setVelocity(0, 0);
+      this._stopCleansing();
+
+      const stats = {
+        wave: this.wave,
+        timeS: Math.round((this.time.now - this.sceneStartTime) / 1000),
+        secured: this.securedCount,
+        corruptPct: this.grid.percentCorrupt()
+      };
+
+      // persist simple high score fields
+      try {
+        const key = 'gl1tch:best';
+        const prev = JSON.parse(localStorage.getItem(key) || '{}');
+        const best = {
+          bestSecured: Math.max(prev.bestSecured || 0, stats.secured),
+          bestWave:    Math.max(prev.bestWave || 0, stats.wave),
+          longestTime: Math.max(prev.longestTime || 0, stats.timeS),
+        };
+        localStorage.setItem(key, JSON.stringify(best));
+      } catch {}
+
+      this.scene.start('Death', stats);
     }
   }
 
