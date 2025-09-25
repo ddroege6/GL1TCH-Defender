@@ -1,10 +1,13 @@
 'use strict';
 
 /**
- * Very small tile engine used by PlayScene.
- * - States: 0=clean, 1=corrupt, 2=cleansed
- * - Renders each tile as a 24x24 Image (fast enough for ~1.5k tiles)
- * - Supports slow seeded corruption spread (BFS-like), cleansing, % metrics.
+ * Minimal tile grid with seeded, tile-by-tile corruption spread and cleansing.
+ * Exposes: window.Grid
+ *
+ * States:
+ *   0 = clean
+ *   1 = corrupt
+ *   2 = cleansed
  */
 (function () {
 
@@ -13,7 +16,7 @@
   class Grid {
     /**
      * @param {Phaser.Scene} scene
-     * @param {{tileSize:number, textures:{clean:string,corrupt:string,cleansed:string}, depthFloor?:number, depthOverlay?:number}} opts
+     * @param {{tileSize:number, textures:{clean:string, corrupt:string, cleansed:string}, depthFloor?:number, depthOverlay?:number}} opts
      */
     constructor(scene, opts) {
       this.scene = scene;
@@ -35,10 +38,11 @@
       // corruption bookkeeping
       this.corruptCount = 0;
       this.seeds = [];   // { frontier:Set<number> }
+
       this._buildSprites();
     }
 
-    // --------------- construction / helpers ----------------
+    // ---------- grid helpers ----------
     _idx(c, r) { return r * this.cols + c; }
     _inBounds(c, r) { return c >= 0 && r >= 0 && c < this.cols && r < this.rows; }
     _tileCenterX(c) { return c * this.size + this.size / 2; }
@@ -46,16 +50,12 @@
 
     _buildSprites() {
       const s = this.size;
-      const add = (c, r, tex) => {
-        const img = this.scene.add.image(this._tileCenterX(c), this._tileCenterY(r), tex)
-          .setOrigin(0.5).setDepth(this.depthFloor).setDisplaySize(s, s).setAlpha(1);
-        return img;
-      };
-
       for (let r = 0; r < this.rows; r++) {
         for (let c = 0; c < this.cols; c++) {
           const i = this._idx(c, r);
-          this.sprites[i] = add(c, r, this.tex.clean);
+          const img = this.scene.add.image(this._tileCenterX(c), this._tileCenterY(r), this.tex.clean)
+            .setOrigin(0.5).setDepth(this.depthFloor).setDisplaySize(s, s).setAlpha(1);
+          this.sprites[i] = img;
         }
       }
     }
@@ -96,7 +96,7 @@
       }
     }
 
-    // --------------- public API ----------------
+    // ---------- public API ----------
 
     regenerate({ initialBlobs = 2 } = {}) {
       // reset
@@ -107,17 +107,16 @@
         this.sprites[i].setTexture(this.tex.clean);
       }
 
-      // create initial seeds (1-2 tiles) near edges to feel like ingress points
+      // create seeds near edges (feels like ingress points)
       for (let s = 0; s < initialBlobs; s++) {
         const edge = Phaser.Math.Between(0, 3);
         const c = edge === 0 ? 1 : edge === 1 ? this.cols - 2 : Phaser.Math.Between(2, this.cols - 3);
         const r = edge === 2 ? 1 : edge === 3 ? this.rows - 2 : Phaser.Math.Between(2, this.rows - 3);
 
-        const front = new Set();
         const i0 = this._idx(c, r);
-        front.add(i0);
+        const frontier = new Set([i0]);
         this._setState(c, r, STATE.CORRUPT);
-        this.seeds.push({ frontier: front });
+        this.seeds.push({ frontier });
       }
     }
 
@@ -128,30 +127,23 @@
     }
 
     /**
-     * Slowly expands each seed 1 step at a time. Called by a timer in PlayScene.
-     * @param {number} stepsPerSeed - tiles to corrupt per seed per tick (default 1..2)
-     * @param {number} maxBudget    - hard cap tiles to corrupt this tick (keeps frame time consistent)
-     * @param {number} chanceNewSeed- 0..1 probability to add a fresh ingress near edges
+     * Expand each seed 1 step at a time (BFS-like).
      */
     slowSpreadTick(stepsPerSeed = 1, maxBudget = 18, chanceNewSeed = 0.06) {
       let budget = maxBudget;
-
       const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+
       for (const seed of this.seeds) {
-        let corruptThisSeed = 0;
-
-        // snapshot of current frontier
+        let corrupted = 0;
         const candidates = Array.from(seed.frontier.values());
-        if (candidates.length === 0) continue;
+        if (!candidates.length) continue;
 
-        // expand from a random subset of frontier
         Phaser.Utils.Array.Shuffle(candidates);
-        for (let idx = 0; idx < candidates.length && corruptThisSeed < stepsPerSeed && budget > 0; idx++) {
+        for (let idx = 0; idx < candidates.length && corrupted < stepsPerSeed && budget > 0; idx++) {
           const i = candidates[idx];
           const c = i % this.cols;
           const r = (i / this.cols) | 0;
 
-          // try 4-neighbors
           Phaser.Utils.Array.Shuffle(dirs);
           for (const [dc, dr] of dirs) {
             const nc = c + dc, nr = r + dr;
@@ -159,30 +151,25 @@
             const ni = this._idx(nc, nr);
             if (this.state[ni] !== STATE.CLEAN) continue;
 
-            // corrupt neighbor
             this._setState(nc, nr, STATE.CORRUPT);
             seed.frontier.add(ni);
-            corruptThisSeed++;
-            budget--;
-            if (budget <= 0 || corruptThisSeed >= stepsPerSeed) break;
+            corrupted++; budget--;
+            if (budget <= 0 || corrupted >= stepsPerSeed) break;
           }
         }
       }
 
-      // occasionally add a new ingress near edges to keep late-game pressure up
       if (Math.random() < chanceNewSeed) {
         const edge = Phaser.Math.Between(0, 3);
         const c = edge === 0 ? 1 : edge === 1 ? this.cols - 2 : Phaser.Math.Between(2, this.cols - 3);
         const r = edge === 2 ? 1 : edge === 3 ? this.rows - 2 : Phaser.Math.Between(2, this.rows - 3);
-        const front = new Set([this._idx(c, r)]);
+        const i0 = this._idx(c, r);
         this._setState(c, r, STATE.CORRUPT);
-        this.seeds.push({ frontier: front });
+        this.seeds.push({ frontier: new Set([i0]) });
       }
     }
 
-    /**
-     * Cleanses a circular area. Returns number of corrupt tiles cleansed.
-     */
+    /** Cleanses a circular area. Returns number of corrupt tiles cleansed. */
     cleanseAt(x, y, radius) {
       let cleaned = 0;
       this._forEachInCircle(x, y, radius, (c, r) => {
@@ -195,22 +182,20 @@
       return cleaned;
     }
 
-    /** Utility used by older code paths; not used by PlayScene now. */
+    /** Optional helper to seed extra blobs. */
     spawnCorruptionBlobs(count = 1, minTiles = 1, maxTiles = 2) {
       for (let k = 0; k < count; k++) {
         const c0 = Phaser.Math.Between(1, this.cols - 2);
         const r0 = Phaser.Math.Between(1, this.rows - 2);
         const tiles = Phaser.Math.Between(minTiles, maxTiles);
-        const front = new Set([this._idx(c0, r0)]);
+        const i0 = this._idx(c0, r0);
+        const frontier = new Set([i0]);
         this._setState(c0, r0, STATE.CORRUPT);
-        this.seeds.push({ frontier: front });
-
-        // prime a tiny patch
+        this.seeds.push({ frontier });
         for (let t = 0; t < tiles; t++) this.slowSpreadTick(1, 1, 0);
       }
     }
   }
 
   window.Grid = Grid;
-
 })();

@@ -1,407 +1,545 @@
 'use strict';
 
-(function () {
+/**
+ * GL1TCH Defense — PlayScene (polished w/ reliable contact death)
+ * - Centered circular bodies for player/enemies
+ * - Cleanse radius = 72px (3 tiles)
+ * - Corrupt tiles are replaced when cleansed
+ * - Proximity fallback check for contact kill (in case an overlap tick is missed)
+ * - NEW: Retry button on defeat overlay
+ */
 
-  // ----------------------------- Tunables -----------------------------
-  const TILE = 24;
+window.PlayScene = new Phaser.Class({
 
-  const ARENA_PADDING = 8;
-  const WAVE_DURATION_S = 50;
+  Extends: Phaser.Scene,
 
-  // racks layout (2x12 tiles each), 6 columns top and 6 bottom
-  const RACK_W_TILES = 2;
-  const RACK_H_TILES = 12;
-  const TOP_ROW_Y_F = 0.28;
-  const BOT_ROW_Y_F = 0.68;
-  const SIDE_MARGIN_F = 0.08;
-  const EXTRA_AISLE_F = 0.04;
+  initialize:
+  function PlayScene() {
+    Phaser.Scene.call(this, { key: 'PlayScene' });
+  },
 
-  // dispersion pacing (slower & smoother than before)
-  const DISP_CURVE_DECAY = 0.985;     // higher = slower growth
-  const DISP_PER_WAVE_MIN = 2;        // minimum pieces per wave
-  const DISP_TWEEN_MS = 650;
+  /* ---------------- Tunables ---------------- */
+  TILE: 24,
 
-  // corruption cadence (seeded, tile-by-tile)
-  const SPREAD_TICK_MS = 750;
+  PLAYER: {
+    speed: 185,
+    blinkDist: 180,
+    blinkCooldown: 1.6,
+    cleanseRadius: 72,            // 3 tiles
+    displayW: 28, displayH: 28,
+    bodyRadius: 16
+  },
 
-  // player/enemy
-  const PLAYER_DISPLAY = 36;
-  const PLAYER_BODY_W = 16;
-  const PLAYER_BODY_H = 20;
-  const PLAYER_SPEED  = 180;
+  ENEMIES: {
+    speedMin: 60, speedMax: 110,
+    spawnEvery: 1200,
+    displayW: 20, displayH: 20,
+    bodyRadius: 12,
+    retargetMS: 160
+  },
 
-  const ENEMY_DISPLAY = 26;
-  const ENEMY_BODY_W  = 14;
-  const ENEMY_BODY_H  = 16;
-  const ENEMY_SPEED   = 95;
+  DIFFICULTY: {
+    waveTime: 30,
+    enemyCapStart: 10,
+    enemyCapPerWave: 10,
+    disperseStartPct: 0.04,
+    dispersePerWavePct: 0.02,
+    corruptionSeeds: 3,
+    corruptionPerTick: 2,
+    corruptionTickMS: 250,
+  },
 
-  const CLEANSE_RADIUS  = 58;
-  const CLEANSE_RATE_MS = 120;
+  RACK_LAYOUT: {
+    cols: 12, rows: 2,
+    tilesHigh: 12,
+    tilesWide: 2,                 // 2×12 columns
+    xMarginPct: 0.12,
+    topYPct: 0.30,
+    rowGapPct: 0.38,
+  },
 
-  class PlayScene extends Phaser.Scene {
-    constructor() { super('Play'); }
+  COLORS: {
+    hud: '#a8e1ff',
+    hudShadow: '#03131d',
+    ringFill: 0x6fd0e5,
+  },
 
-    init() {
-      this.wave = 1;
-      this.securedCount = 0;
-      this.dead = false;
-      this.waveEndsAt = this.time.now + WAVE_DURATION_S * 1000;
+  /* ---------------- Create ---------------- */
+  create() {
+    this.W = this.scale.gameSize.width;
+    this.H = this.scale.gameSize.height;
 
-      this.rackTiles = [];
-      this.initialRackCount = 0;
-      this.cumulativeDispersed = 0;
+    this._ensureFallbackTextures();
+    this._buildFloor();
 
-      this.isCleansing = false;
-      this.nextCleanseAt = 0;
-      this.sceneStartTime = this.time.now;
+    // Groups
+    this.rackGroup     = this.physics.add.staticGroup();
+    this.obstacleGroup = this.physics.add.staticGroup();
+    this.enemies       = this.physics.add.group({ collideWorldBounds: true });
+
+    // State
+    this.rackTiles = [];
+    this.corruptTiles = new Set();    // "gx,gy"
+    this.corruptFrontier = [];
+    this.tileSprites = new Map();     // corrupt key -> sprite
+    this.cleansedCount = 0;
+    this.dead = false;
+
+    this.wave = 1;
+    this.waveTimeLeft = this.DIFFICULTY.waveTime;
+    this.lastBlinkAt = -999;
+
+    this.physics.world.setBounds(0, 0, this.W, this.H);
+
+    // Map + seeds
+    this._buildRacks();
+    this._seedCorruption();
+
+    // Player
+    const defKey = this.textures.exists('defender') ? 'defender' : 'defender_fallback';
+    this.player = this.physics.add.sprite(this.W * 0.5, this.H * 0.5, defKey)
+      .setDepth(10)
+      .setDisplaySize(this.PLAYER.displayW, this.PLAYER.displayH)
+      .setCircle(this.PLAYER.bodyRadius)
+      .setDrag(1000, 1000)
+      .setMaxVelocity(this.PLAYER.speed)
+      .setCollideWorldBounds(true);
+
+    // Center the circular body after scaling (critical for accurate overlaps)
+    this.player.body.setOffset(
+      this.player.width  / 2 - this.PLAYER.bodyRadius,
+      this.player.height / 2 - this.PLAYER.bodyRadius
+    );
+
+    // Precompute squared distance threshold for proximity kill (slightly forgiving)
+    const extra = 2; // shrink a tad so visual touch kills
+    const killR = this.PLAYER.bodyRadius + this.ENEMIES.bodyRadius - extra;
+    this._killDist2 = killR * killR;
+
+    // Input
+    this.cursors  = this.input.keyboard.createCursorKeys();
+    this.keys     = this.input.keyboard.addKeys('W,A,S,D,E,SHIFT,SPACE');
+    this.pointer  = this.input.activePointer;
+    this.prevRMB  = false;
+
+    // Cleanse ring
+    this.cleanseGfx = this.add.graphics().setDepth(6).setAlpha(0);
+
+    // Collisions
+    this.physics.add.collider(this.player,  this.rackGroup);
+    this.physics.add.collider(this.player,  this.obstacleGroup);
+    this.physics.add.collider(this.enemies, this.rackGroup);
+    this.physics.add.collider(this.enemies, this.obstacleGroup);
+
+    // Overlap-based contact kill
+    this.physics.add.overlap(this.player, this.enemies, this._handleHit, null, this);
+
+    // Timers
+    this.time.addEvent({ delay: this.ENEMIES.spawnEvery,          loop: true, callback: () => this._maybeSpawnEnemy() });
+    this.time.addEvent({ delay: this.DIFFICULTY.corruptionTickMS, loop: true, callback: () => this._spreadCorruptionTick() });
+    this.time.addEvent({
+      delay: 1000, loop: true,
+      callback: () => { if (--this.waveTimeLeft <= 0) this._nextWave(); }
+    });
+    this.time.addEvent({
+      delay: this.ENEMIES.retargetMS, loop: true,
+      callback: () => this._retargetEnemies()
+    });
+
+    this._buildHUD();
+  },
+
+  update() {
+    if (this.dead) return;
+    this._updateMovement();
+    this._updateCleanse();
+
+    // Fallback proximity kill (covers any rare missed overlap tick)
+    this._checkProximityKills();
+
+    this._updateHUD();
+  },
+
+  /* -------- Helper textures -------- */
+  _ensureFallbackTextures() {
+    const g = this.make.graphics({ x: 0, y: 0, add: false });
+    const rect = (key, w, h, fill, a = 1, stroke = false) => {
+      if (this.textures.exists(key)) return;
+      g.clear(); g.fillStyle(fill, a); g.fillRect(0, 0, w, h);
+      if (stroke) { g.lineStyle(2, 0x0b1118, 0.4); g.strokeRect(0.5, 0.5, w - 1, h - 1); }
+      g.generateTexture(key, w, h);
+    };
+    rect('rack_fallback', this.TILE, this.TILE, 0x103043, 1, true);
+    rect('corrupt_fallback', this.TILE, this.TILE, 0xff6a85, 0.9, false);
+    rect('clean_fallback', this.TILE, this.TILE, 0x1b242c, 1, false);
+    rect('defender_fallback', this.TILE, this.TILE, 0x7bd3ff, 1, false);
+    rect('virus_fallback', this.TILE, this.TILE, 0x2b2bff, 1, false);
+  },
+
+  /* -------- Floor -------- */
+  _buildFloor() {
+    const key = this.textures.exists('tile_path_clean') ? 'tile_path_clean' : 'clean_fallback';
+    const src = this.textures.get(key).getSourceImage();
+    const ts  = this.add.tileSprite(0, 0, this.W, this.H, key)
+      .setOrigin(0, 0)
+      .setDepth(0);
+    ts.tileScaleX = this.TILE / src.width;
+    ts.tileScaleY = this.TILE / src.height;
+  },
+
+  /* -------- Racks -------- */
+  _buildRacks() {
+    const T = this.TILE;
+    const { cols, rows, tilesHigh, tilesWide, xMarginPct, topYPct, rowGapPct } = this.RACK_LAYOUT;
+
+    const left  = this.W * xMarginPct;
+    const right = this.W * (1 - xMarginPct);
+    const span  = right - left;
+    const stepX = cols > 1 ? span / (cols - 1) : 0;
+
+    const rowYs = [];
+    for (let r = 0; r < rows; r++) {
+      rowYs.push(Phaser.Math.Clamp(this.H * (topYPct + r * rowGapPct), T * 2, this.H - T * 2));
     }
 
-    create() {
-      const { width: W, height: H } = this.scale.gameSize;
-      this.physics.world.setBounds(0, 0, W, H);
+    const rackKey = this.textures.exists('rack_tile') ? 'rack_tile'
+                  : (this.textures.exists('tile_path_clean') ? 'tile_path_clean' : 'rack_fallback');
 
-      // ----- grid with seeded spread -----
-      this.grid = new window.Grid(this, {
-        tileSize: TILE,
-        textures: {
-          clean:    'tile_path_clean',
-          corrupt:  'tile_path_corrupt',
-          cleansed: 'tile_path_cleansed',
-        },
-        depthFloor: -10,
-        depthOverlay: -3,
-      });
-      this.grid.regenerate({ initialBlobs: 2 });
+    const addRack = (cx, cy) => {
+      const yTop  = Math.round(cy - (tilesHigh / 2) * T);
+      const xLeft = Math.round(cx - (tilesWide / 2) * T) + T / 2;
 
-      // spread timer (tile-by-tile from seeds)
-      this.spreadTimer = this.time.addEvent({
-        delay: SPREAD_TICK_MS, loop: true,
-        callback: () => {
-          // slightly scale with wave for pressure
-          const steps = 1 + Math.floor(this.wave / 3);
-          const budget = 8 + this.wave * 2;
-          this.grid.slowSpreadTick(steps, budget, 0.05);
+      for (let i = 0; i < tilesHigh; i++) {
+        for (let j = 0; j < tilesWide; j++) {
+          const x = xLeft + j * T;
+          const y = yTop + i * T + T / 2;
+          const tile = this.physics.add.staticImage(x, y, rackKey)
+            .setOrigin(0.5)
+            .setDisplaySize(T, T)
+            .setDepth(2)
+            .setAlpha(0.98);
+          tile.refreshBody(); // tight 24×24
+          this.rackGroup.add(tile);
+          this.rackTiles.push(tile);
+        }
+      }
+    };
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        addRack(Math.round(left + c * stepX), rowYs[r]);
+      }
+    }
+  },
+
+  _disperseRackTilesForWave() {
+    const total = this.rackTiles.length;
+    if (!total) return;
+
+    const base = this.DIFFICULTY.disperseStartPct;
+    const inc  = this.DIFFICULTY.dispersePerWavePct;
+    const pct  = Phaser.Math.Clamp(base + Math.max(0, this.wave - 2) * inc, 0, 0.35);
+
+    let toMove = Math.max(1, Math.floor(total * pct));
+    toMove = Math.min(toMove, total);
+
+    const T = this.TILE;
+    const rackKey = this.textures.exists('rack_tile') ? 'rack_tile'
+                  : (this.textures.exists('tile_path_clean') ? 'tile_path_clean' : 'rack_fallback');
+
+    const radius = T * 8;
+    Phaser.Utils.Array.Shuffle(this.rackTiles).slice(0, toMove).forEach(staticTile => {
+      const { x, y } = staticTile;
+      staticTile.destroy();
+
+      const sprite = this.add.image(x, y, rackKey).setOrigin(0.5).setDisplaySize(T, T).setDepth(2).setAlpha(0.98);
+      const nx = Phaser.Math.Clamp(x + Phaser.Math.Between(-radius, radius), T * 2, this.W - T * 2);
+      const ny = Phaser.Math.Clamp(y + Phaser.Math.Between(-radius, radius), T * 2, this.H - T * 2);
+
+      this.tweens.add({
+        targets: sprite,
+        x: nx, y: ny,
+        duration: Phaser.Math.Between(450, 900),
+        ease: 'Sine.easeInOut',
+        onComplete: () => {
+          const ph = this.physics.add.staticImage(sprite.x, sprite.y, rackKey)
+            .setOrigin(0.5).setDisplaySize(T, T).setDepth(2).setAlpha(0.98);
+          ph.refreshBody();
+          this.obstacleGroup.add(ph);
+          sprite.destroy();
         }
       });
+    });
 
-      // ----- racks -----
-      this._buildRacks();
+    this.rackTiles = this.rackTiles.filter(t => t.active);
+  },
 
-      // ----- player -----
-      this.player = this.physics.add.image(W * 0.50, H * 0.50, 'defender')
-        .setDepth(5).setOrigin(0.5).setDisplaySize(PLAYER_DISPLAY, PLAYER_DISPLAY)
-        .setCollideWorldBounds(true);
-      this.player.body.setSize(PLAYER_BODY_W, PLAYER_BODY_H, true);
+  /* -------- Corruption (organic) -------- */
+  _tileKey(px, py) {
+    const gx = Math.floor(px / this.TILE);
+    const gy = Math.floor(py / this.TILE);
+    return `${gx},${gy}`;
+  },
 
-      // ----- input -----
-      this._setupInput();
+  _paintCorruptTile(px, py, seed = false) {
+    const key = this._tileKey(px, py);
+    if (this.corruptTiles.has(key)) return;
 
-      // ----- enemies -----
-      this.enemies = this.physics.add.group();
-      this._topUpEnemies(true);
-      this.enemyTopUpTimer = this.time.addEvent({
-        delay: 1800, loop: true, callback: () => this._topUpEnemies(false),
-      });
+    const tex = this.textures.exists('tile_path_corrupt') ? 'tile_path_corrupt' : 'corrupt_fallback';
+    const spr = this.add.image(
+      Math.floor(px / this.TILE) * this.TILE + this.TILE / 2,
+      Math.floor(py / this.TILE) * this.TILE + this.TILE / 2,
+      tex
+    ).setOrigin(0.5).setDisplaySize(this.TILE, this.TILE).setDepth(1).setAlpha(0.92);
 
-      // debris (dynamic while tweening)
-      this.debrisDynamic = this.physics.add.group({ allowGravity: false });
-      this.physics.add.collider(this.player,  this.debrisDynamic);
-      this.physics.add.collider(this.enemies, this.debrisDynamic);
+    this.corruptTiles.add(key);
+    this.tileSprites.set(key, spr);   // track sprite so we can replace it
+    if (seed) this.corruptFrontier.push(key);
+  },
 
-      // collisions
-      this.physics.add.collider(this.player,  this.rackGroup);
-      this.physics.add.collider(this.enemies, this.rackGroup);
-      this.physics.add.overlap (this.player,  this.enemies, this._onPlayerHit, null, this);
-      this.physics.add.collider(this.player,  this.enemies, this._onPlayerHit, null, this);
-
-      // HUD + cleanse ring
-      this._buildHud();
-      this.cleanseGfx = this.add.graphics().setDepth(6).setScrollFactor(0).setBlendMode(Phaser.BlendModes.ADD).setAlpha(0).setVisible(false);
-
-      this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
-        this.enemyTopUpTimer?.destroy();
-        this.spreadTimer?.destroy();
-        this.tweens.killAll();
-      });
+  _seedCorruption() {
+    for (let i = 0; i < this.DIFFICULTY.corruptionSeeds; i++) {
+      const x = Phaser.Math.Between(this.TILE * 4, this.W - this.TILE * 4);
+      const y = Phaser.Math.Between(this.TILE * 4, this.H - this.TILE * 4);
+      this._paintCorruptTile(x, y, true);
     }
+  },
 
-    // --------------------------- layout ---------------------------
-    _buildRacks() {
-      const { width: W, height: H } = this.scale.gameSize;
+  _spreadCorruptionTick() {
+    const step = this.DIFFICULTY.corruptionPerTick;
+    for (let i = 0; i < step; i++) {
+      if (!this.corruptFrontier.length) break;
 
-      this.rackGroup = this.physics.add.staticGroup();
-      this.rackTiles.length = 0;
+      const idx = Phaser.Math.Between(0, this.corruptFrontier.length - 1);
+      const key = this.corruptFrontier.splice(idx, 1)[0];
+      const [gx, gy] = key.split(',').map(Number);
 
-      const tex = this.textures.exists('rack_tile') ? 'rack_tile' : 'tile_path_clean';
-      const tint= this.textures.exists('rack_tile') ? 0xffffff : 0x16384e;
+      const candidates = [
+        [gx + 1, gy, 0.75], [gx - 1, gy, 0.75], [gx, gy + 1, 0.75], [gx, gy - 1, 0.75],
+        [gx + 1, gy + 1, 0.40], [gx - 1, gy + 1, 0.40], [gx + 1, gy - 1, 0.40], [gx - 1, gy - 1, 0.40],
+      ];
+      Phaser.Utils.Array.Shuffle(candidates);
 
-      const spawnColumn = (cx, cy) => {
-        const rackW = RACK_W_TILES * TILE;
-        const rackH = RACK_H_TILES * TILE;
-        const x0 = Math.round(cx - rackW / 2);
-        const y0 = Math.round(cy - rackH / 2);
+      const growCount = Phaser.Math.Between(1, 3);
+      let grown = 0;
 
-        for (let ty = 0; ty < RACK_H_TILES; ty++) {
-          for (let tx = 0; tx < RACK_W_TILES; tx++) {
-            const x = x0 + tx * TILE + TILE / 2;
-            const y = y0 + ty * TILE + TILE / 2;
-            const s = this.physics.add.staticImage(x, y, tex)
-              .setOrigin(0.5).setDisplaySize(TILE, TILE).setDepth(2).setTint(tint).setAlpha(0.98);
-            s.refreshBody();                // make static body exactly 24x24
-            this.rackGroup.add(s);
-            this.rackTiles.push(s);
+      for (const [nx, ny, prob] of candidates) {
+        if (grown >= growCount) break;
+        if (Math.random() > prob) continue;
+
+        const px = nx * this.TILE + this.TILE / 2;
+        const py = ny * this.TILE + this.TILE / 2;
+        if (px < 0 || py < 0 || px > this.W || py > this.H) continue;
+
+        const nkey = `${nx},${ny}`;
+        if (!this.corruptTiles.has(nkey)) {
+          this._paintCorruptTile(px, py, false);
+          this.corruptFrontier.push(nkey);
+          grown++;
+        }
+      }
+
+      if (grown === 0) this.corruptFrontier.push(key);
+    }
+  },
+
+  /* -------- Enemies -------- */
+  _enemyCapForWave() {
+    return this.DIFFICULTY.enemyCapStart + (this.wave - 1) * this.DIFFICULTY.enemyCapPerWave;
+  },
+
+  _maybeSpawnEnemy() {
+    if (this.dead) return;
+    if (this.enemies.getChildren().length >= this._enemyCapForWave()) return;
+
+    const margin = 40;
+    let x, y;
+    switch (Phaser.Math.Between(0, 3)) {
+      case 0: x = margin; y = Phaser.Math.Between(margin, this.H - margin); break;
+      case 1: x = this.W - margin; y = Phaser.Math.Between(margin, this.H - margin); break;
+      case 2: x = Phaser.Math.Between(margin, this.W - margin); y = margin; break;
+      default: x = Phaser.Math.Between(margin, this.W - margin); y = this.H - margin; break;
+    }
+    if (Phaser.Math.Distance.Between(x, y, this.player.x, this.player.y) < 200) return;
+
+    const key = this.textures.exists('virus') ? 'virus' : 'virus_fallback';
+    const e = this.enemies.create(x, y, key)
+      .setDepth(5)
+      .setDisplaySize(this.ENEMIES.displayW, this.ENEMIES.displayH)
+      .setCircle(this.ENEMIES.bodyRadius)
+      .setBounce(1, 1);
+
+    // Center enemy circular body after scaling
+    e.body.setOffset(
+      e.width  / 2 - this.ENEMIES.bodyRadius,
+      e.height / 2 - this.ENEMIES.bodyRadius
+    );
+
+    e.baseSpeed = Phaser.Math.Between(this.ENEMIES.speedMin, this.ENEMIES.speedMax);
+    this._aimEnemy(e);
+  },
+
+  _retargetEnemies() {
+    if (this.dead) return;
+    this.enemies.getChildren().forEach(e => this._aimEnemy(e));
+  },
+
+  _aimEnemy(e) {
+    if (!e || !e.active) return;
+    const ang = Phaser.Math.Angle.Between(e.x, e.y, this.player.x, this.player.y)
+              + Phaser.Math.FloatBetween(-0.20, 0.20);
+    const spd = e.baseSpeed || Phaser.Math.Between(this.ENEMIES.speedMin, this.ENEMIES.speedMax);
+    e.setVelocity(Math.cos(ang) * spd, Math.sin(ang) * spd);
+    e.setFlipX(e.body.velocity.x < 0);
+  },
+
+  _handleHit(player, enemy) {
+    if (this.dead || !player.active || !enemy.active) return;
+    this._onPlayerDeath();
+  },
+
+  // Distance-based fallback (runs every frame)
+  _checkProximityKills() {
+    if (this.dead) return;
+    const px = this.player.x, py = this.player.y;
+    const list = this.enemies.getChildren();
+    for (let i = 0; i < list.length; i++) {
+      const e = list[i];
+      if (!e.active) continue;
+      const dx = e.x - px, dy = e.y - py;
+      if (dx * dx + dy * dy <= this._killDist2) {
+        this._onPlayerDeath();
+        return;
+      }
+    }
+  },
+
+  /* -------- Movement / Cleanse / Blink -------- */
+  _updateMovement() {
+    const v = new Phaser.Math.Vector2(0, 0);
+    const sp = this.PLAYER.speed;
+
+    if (this.cursors.left.isDown || this.keys.A.isDown) v.x -= sp;
+    if (this.cursors.right.isDown || this.keys.D.isDown) v.x += sp;
+    if (this.cursors.up.isDown || this.keys.W.isDown) v.y -= sp;
+    if (this.cursors.down.isDown || this.keys.S.isDown) v.y += sp;
+
+    this.player.setVelocity(v.x, v.y);
+    if (Math.abs(v.x) > 2) this.player.setFlipX(v.x < 0);
+
+    // Blink (space or right mouse edge)
+    const now = this.time.now / 1000;
+    const rmbDown = (this.input.mousePointer && this.input.mousePointer.rightButtonDown())
+      ? this.input.mousePointer.rightButtonDown()
+      : false;
+
+    const blinkPressed = Phaser.Input.Keyboard.JustDown(this.keys.SPACE) || (rmbDown && !this.prevRMB);
+    this.prevRMB = rmbDown;
+
+    if (blinkPressed && (now - this.lastBlinkAt) >= this.PLAYER.blinkCooldown) {
+      this.lastBlinkAt = now;
+      const aim = Phaser.Math.Angle.Between(this.player.x, this.player.y, this.pointer.worldX, this.pointer.worldY);
+      const nx = Phaser.Math.Clamp(this.player.x + Math.cos(aim) * this.PLAYER.blinkDist, 20, this.W - 20);
+      const ny = Phaser.Math.Clamp(this.player.y + Math.sin(aim) * this.PLAYER.blinkDist, 20, this.H - 20);
+      this.player.setPosition(nx, ny);
+    }
+  },
+
+  _updateCleanse() {
+    const leftDown = this.input.activePointer.isDown && !(
+      this.input.mousePointer && this.input.mousePointer.rightButtonDown && this.input.mousePointer.rightButtonDown()
+    );
+    const want = this.keys.E.isDown || this.keys.SHIFT.isDown || leftDown;
+
+    const gfx = this.cleanseGfx;
+    if (want) {
+      gfx.clear();
+      gfx.fillStyle(this.COLORS.ringFill, 0.18);
+      gfx.fillCircle(this.player.x, this.player.y, this.PLAYER.cleanseRadius);
+      if (gfx.alpha < 0.25) gfx.setAlpha(Phaser.Math.Linear(gfx.alpha, 0.25, 0.35));
+
+      const r2 = this.PLAYER.cleanseRadius * this.PLAYER.cleanseRadius;
+      const gxMin = Math.floor((this.player.x - this.PLAYER.cleanseRadius) / this.TILE);
+      const gyMin = Math.floor((this.player.y - this.PLAYER.cleanseRadius) / this.TILE);
+      const gxMax = Math.floor((this.player.x + this.PLAYER.cleanseRadius) / this.TILE);
+      const gyMax = Math.floor((this.player.y + this.PLAYER.cleanseRadius) / this.TILE);
+
+      const cleanseTex = this.textures.exists('tile_path_cleansed') ? 'tile_path_cleansed' : 'clean_fallback';
+
+      for (let gx = gxMin; gx <= gxMax; gx++) {
+        for (let gy = gyMin; gy <= gyMax; gy++) {
+          const cx = gx * this.TILE + this.TILE / 2;
+          const cy = gy * this.TILE + this.TILE / 2;
+          const dx = cx - this.player.x, dy = cy - this.player.y;
+          if (dx * dx + dy * dy <= r2) {
+            const key = `${gx},${gy}`;
+            if (this.corruptTiles.delete(key)) {
+              const old = this.tileSprites.get(key);
+              if (old) { old.destroy(); this.tileSprites.delete(key); }
+              this.cleansedCount++;
+              this.add.image(cx, cy, cleanseTex)
+                .setOrigin(0.5).setDisplaySize(this.TILE, this.TILE).setDepth(1).setAlpha(0.85);
+            }
           }
         }
-      };
-
-      const xs = (() => {
-        const left  = W * SIDE_MARGIN_F;
-        const right = W * (1 - SIDE_MARGIN_F);
-        const usable = right - left;
-        const spacing = usable / 7; // 6 cols -> 7 gaps
-        const out = [];
-        for (let i = 1; i <= 6; i++) out.push(left + i * spacing + (i - 3.5) * (W * EXTRA_AISLE_F / 6));
-        return out;
-      })();
-
-      xs.forEach(x => spawnColumn(x, H * TOP_ROW_Y_F));
-      xs.forEach(x => spawnColumn(x, H * BOT_ROW_Y_F));
-
-      this.initialRackCount = this.rackTiles.length;
-      this.cumulativeDispersed = 0;
-    }
-
-    // --------------------------- input ---------------------------
-    _setupInput() {
-      this.cursors = this.input.keyboard.createCursorKeys();
-      this.keyW    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.W);
-      this.keyA    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
-      this.keyS    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.S);
-      this.keyD    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D);
-      this.keyE    = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
-      this.keySHIFT= this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SHIFT);
-      this.keySPACE= this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
-
-      this.input.on('pointerdown', () => this._startCleansing());
-      this.input.on('pointerup',   () => this._stopCleansing());
-      this.keyE.on('down',         () => this._startCleansing());
-      this.keyE.on('up',           () => this._stopCleansing());
-      this.keySHIFT.on('down',     () => this._startCleansing());
-      this.keySHIFT.on('up',       () => this._stopCleansing());
-    }
-
-    // --------------------------- HUD ---------------------------
-    _buildHud() {
-      this.hud = {};
-      this.hud.text = this.add.text(12, 8, '', {
-        fontFamily: 'monospace', fontSize: '18px', color: '#a7e8ff'
-      }).setDepth(50).setScrollFactor(0);
-
-      this.blinkReadyAt = 0;
-      this.blinkCooldownMs = 1400;
-      this.hudRing = this.add.graphics().setDepth(50).setScrollFactor(0);
-      this._drawBlinkRing(1);
-    }
-    _drawBlinkRing(alpha) {
-      const { width: W } = this.scale.gameSize;
-      const x = W - 42, y = 40, r = 20;
-      const g = this.hudRing;
-      g.clear();
-      g.lineStyle(4, 0x61dafb, 0.85);
-      g.strokeCircle(x, y, r);
-      g.beginPath();
-      g.arc(x, y, r, -Math.PI/2, -Math.PI/2 + Math.PI*2*alpha, false);
-      g.strokePath();
-      g.closePath();
-    }
-
-    // --------------------------- loop ---------------------------
-    update(time) {
-      if (this.dead) return;
-
-      // movement
-      const vx = (this.keyD.isDown || this.cursors.right.isDown) - (this.keyA.isDown || this.cursors.left.isDown);
-      const vy = (this.keyS.isDown || this.cursors.down.isDown)  - (this.keyW.isDown || this.cursors.up.isDown);
-      const v  = new Phaser.Math.Vector2(vx, vy).normalize().scale(PLAYER_SPEED);
-      this.player.setVelocity(v.x, v.y);
-      if (v.x < -0.01) this.player.setFlipX(true);
-      else if (v.x > 0.01) this.player.setFlipX(false);
-
-      // blink
-      const ready = time >= this.blinkReadyAt;
-      if (Phaser.Input.Keyboard.JustDown(this.keySPACE) && ready) {
-        const dir = v.lengthSq() > 0 ? v.clone().normalize() : new Phaser.Math.Vector2(1, 0);
-        const dist = 160;
-        const nx = Phaser.Math.Clamp(this.player.x + dir.x * dist, ARENA_PADDING, this.scale.gameSize.width  - ARENA_PADDING);
-        const ny = Phaser.Math.Clamp(this.player.y + dir.y * dist, ARENA_PADDING, this.scale.gameSize.height - ARENA_PADDING);
-        this.player.setPosition(nx, ny);
-        this.player.body.reset(nx, ny);
-        this.blinkReadyAt = time + this.blinkCooldownMs;
       }
-      const cd = Math.max(0, this.blinkReadyAt - time);
-      this._drawBlinkRing(1 - cd / this.blinkCooldownMs);
-
-      // cleanse (hold)
-      if (this.isCleansing) {
-        this._showCleanseFill(this.player.x, this.player.y);
-        if (time >= this.nextCleanseAt) {
-          const cleaned = this.grid.cleanseAt(this.player.x, this.player.y, CLEANSE_RADIUS);
-          this.securedCount += cleaned;
-          this.nextCleanseAt = time + CLEANSE_RATE_MS;
-        }
-      }
-
-      // enemy AI + facing
-      this.enemies.children.iterate((e) => {
-        if (!e || !e.active) return;
-        const dir = new Phaser.Math.Vector2(this.player.x - e.x, this.player.y - e.y).normalize();
-        e.setVelocity(dir.x * ENEMY_SPEED, dir.y * ENEMY_SPEED);
-        if (e.body.velocity.x < -0.01) e.setFlipX(true);
-        else if (e.body.velocity.x > 0.01) e.setFlipX(false);
-      });
-
-      // waves
-      if (time >= this.waveEndsAt) {
-        this._onWaveEnd();
-        this.waveEndsAt = time + WAVE_DURATION_S * 1000;
-      }
-
-      // HUD
-      const remain = Math.max(0, Math.ceil((this.waveEndsAt - time) / 1000));
-      this.hud.text.setText(
-        `WAVE ${this.wave} | 00:${remain.toString().padStart(2,'0')} | Corrupt: ${this.grid.percentCorrupt()}% | Secured: ${this.securedCount}`
-      );
+    } else {
+      if (gfx.alpha > 0) { gfx.setAlpha(Math.max(0, gfx.alpha - 0.12)); if (gfx.alpha <= 0.01) gfx.clear(); }
     }
+  },
 
-    // cleanse visuals
-    _startCleansing() { this.isCleansing = true;  this.nextCleanseAt = 0; }
-    _stopCleansing()  {
-      this.isCleansing = false;
-      const g = this.cleanseGfx;
-      this.tweens.killTweensOf(g);
-      this.tweens.add({ targets: g, alpha: 0, duration: 180, ease: 'Sine.easeOut', onComplete: () => { g.clear(); g.setVisible(false); }});
-    }
-    _showCleanseFill(x, y) {
-      const g = this.cleanseGfx;
-      g.clear();
-      g.fillStyle(0x61dafb, 0.18);
-      g.fillCircle(x, y, CLEANSE_RADIUS);
-      g.setAlpha(1).setVisible(true);
-    }
+  /* -------- Waves / HUD / Death -------- */
+  _nextWave() {
+    this.wave++;
+    this.waveTimeLeft = this.DIFFICULTY.waveTime;
+    this._disperseRackTilesForWave();
+  },
 
-    // enemies
-    _capForWave() { return Math.min(8 + this.wave * 2, 42); }
-    _topUpEnemies(force) {
-      const { width: W, height: H } = this.scale.gameSize;
-      const need = this._capForWave() - this.enemies.countActive(true);
-      if (!force && need <= 0) return;
-      for (let i = 0; i < Math.max(0, need); i++) {
-        const side = Phaser.Math.Between(0, 3);
-        let x, y;
-        if (side === 0) { x = -30;            y = 40 + Math.random() * (H - 80); }
-        if (side === 1) { x = W + 30;         y = 40 + Math.random() * (H - 80); }
-        if (side === 2) { x = 40 + Math.random() * (W - 80); y = -30; }
-        if (side === 3) { x = 40 + Math.random() * (W - 80); y = H + 30; }
+  _onPlayerDeath() {
+    this.dead = true;
+    this.player.setTint(0xff3b3b).setVelocity(0, 0);
 
-        const e = this.enemies.create(x, y, 'virus')
-          .setOrigin(0.5).setDisplaySize(ENEMY_DISPLAY, ENEMY_DISPLAY)
-          .setDepth(4).setCollideWorldBounds(true);
-        e.body.setSize(ENEMY_BODY_W, ENEMY_BODY_H, true);
-      }
-    }
+    try {
+      const def = { bestSecured: 0, bestWave: 0, longestTime: 0 };
+      const best = Object.assign(def, JSON.parse(localStorage.getItem('gl1tch:best') || '{}'));
+      best.bestSecured = Math.max(best.bestSecured || 0, this.cleansedCount);
+      best.bestWave    = Math.max(best.bestWave || 0, this.wave);
+      const elapsed = (this.DIFFICULTY.waveTime * (this.wave - 1)) + (this.DIFFICULTY.waveTime - this.waveTimeLeft);
+      best.longestTime = Math.max(best.longestTime || 0, elapsed);
+      localStorage.setItem('gl1tch:best', JSON.stringify(best));
+    } catch {}
 
-    // waves / rack dispersion (slower + smooth)
-    _onWaveEnd() {
-      this.wave += 1;
+    // Overlay
+    this.add.rectangle(this.W / 2, this.H / 2, this.W, this.H, 0x000000, 0.72).setDepth(100);
+    this.add.text(this.W / 2, this.H / 2 - 40,
+      `DEFEATED\nWave ${this.wave}\nCleansed: ${this.cleansedCount}`,
+      { fontFamily: 'monospace', fontSize: 24, color: '#ffffff', align: 'center' }
+    ).setOrigin(0.5).setDepth(101);
 
-      const delta = this._tilesToDisperseThisWave();
-      if (delta > 0) this._disperseRackTiles(delta);
+    // NEW: Retry button — restart this scene
+    const retryBtn = this.add.text(this.W / 2, this.H / 2 + 26, 'Retry', {
+      fontFamily: 'monospace', fontSize: 18, color: '#a8e1ff', backgroundColor: '#0b1118'
+    }).setOrigin(0.5).setPadding(8, 6, 8, 6).setDepth(101).setInteractive({ useHandCursor: true });
+    retryBtn.on('pointerup', () => this.scene.restart());
 
-      this._topUpEnemies(true);
-    }
+    // Existing: Return to Home
+    const homeBtn = this.add.text(this.W / 2, this.H / 2 + 60, 'Return to Home', {
+      fontFamily: 'monospace', fontSize: 18, color: '#a8e1ff', backgroundColor: '#0b1118'
+    }).setOrigin(0.5).setPadding(8, 6, 8, 6).setDepth(101).setInteractive({ useHandCursor: true });
+    homeBtn.on('pointerup', () => this.scene.start('HomeScene'));
+  },
 
-    _tilesToDisperseThisWave() {
-      // cumulative target = initial * (1 - decay^wave)
-      const targetCumulative = Math.floor(this.initialRackCount * (1 - Math.pow(DISP_CURVE_DECAY, this.wave)));
-      const delta = Math.max(0, targetCumulative - this.cumulativeDispersed);
-      return Math.max(delta, (this.wave > 1 ? DISP_PER_WAVE_MIN : 0));
-    }
+  _buildHUD() {
+    this.hud = this.add.text(10, 6, '', {
+      fontFamily: 'monospace', fontSize: 14, color: this.COLORS.hud,
+      shadow: { color: this.COLORS.hudShadow, fill: true, offsetX: 1, offsetY: 1 }
+    }).setDepth(50);
+  },
 
-    _disperseRackTiles(count) {
-      const { width: W, height: H } = this.scale.gameSize;
-      const pool = this.rackTiles.filter(s => s.active && s.visible);
-      if (pool.length === 0) return;
+  _updateHUD() {
+    const sec = String(this.waveTimeLeft).padStart(2, '0');
+    const corruptPct = Math.min(99, Math.round((this.corruptTiles.size / 2000) * 100));
+    this.hud.setText(`WAVE ${this.wave} | 00:${sec} | Corrupt: ${corruptPct}% | Secured: ${this.cleansedCount}`);
+  },
 
-      Phaser.Utils.Array.Shuffle(pool);
-      const take = Math.min(count, pool.length);
-
-      for (let i = 0; i < take; i++) {
-        const s = pool[i];
-        this.rackGroup.remove(s);
-        s.disableBody(true, true);
-
-        const tex = this.textures.exists('rack_tile') ? 'rack_tile' : 'tile_path_clean';
-        const d = this.debrisDynamic.create(s.x, s.y, tex)
-          .setOrigin(0.5).setDisplaySize(TILE, TILE).setDepth(4)
-          .setBounce(0.2).setCollideWorldBounds(true);
-
-        const pad = ARENA_PADDING + TILE;
-        const tx = Phaser.Math.Between(pad, W - pad);
-        const ty = Phaser.Math.Between(pad, H - pad);
-
-        this.tweens.add({
-          targets: d, x: tx, y: ty, duration: DISP_TWEEN_MS, ease: 'Sine.easeInOut',
-          onComplete: () => this._convertDebrisToStatic(d)
-        });
-
-        this.cumulativeDispersed += 1;
-      }
-
-      this.physics.add.collider(this.player,  this.rackGroup);
-      this.physics.add.collider(this.enemies, this.rackGroup);
-    }
-
-    _convertDebrisToStatic(dyn) {
-      const x = dyn.x, y = dyn.y;
-      const tex = dyn.texture.key;
-      this.debrisDynamic.remove(dyn, true, true);
-
-      const s = this.physics.add.staticImage(x, y, tex)
-        .setOrigin(0.5).setDisplaySize(TILE, TILE).setDepth(2).setAlpha(0.98);
-      s.refreshBody();
-      this.rackGroup.add(s);
-      this.rackTiles.push(s);
-    }
-
-    // death + score save
-    _onPlayerHit() {
-      if (this.dead) return;
-      this.dead = true;
-      this.player.setVelocity(0, 0);
-      this._stopCleansing();
-
-      const stats = {
-        wave: this.wave,
-        timeS: Math.round((this.time.now - this.sceneStartTime) / 1000),
-        secured: this.securedCount,
-        corruptPct: this.grid.percentCorrupt()
-      };
-
-      // persist simple high score fields
-      try {
-        const key = 'gl1tch:best';
-        const prev = JSON.parse(localStorage.getItem(key) || '{}');
-        const best = {
-          bestSecured: Math.max(prev.bestSecured || 0, stats.secured),
-          bestWave:    Math.max(prev.bestWave || 0, stats.wave),
-          longestTime: Math.max(prev.longestTime || 0, stats.timeS),
-        };
-        localStorage.setItem(key, JSON.stringify(best));
-      } catch {}
-
-      this.scene.start('Death', stats);
-    }
-  }
-
-  window.PlayScene = PlayScene;
-})();
+});
