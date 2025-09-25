@@ -1,3 +1,6 @@
+<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/69c264f1-72f3-4096-9f1a-8dbbd9e98684" />
+
+
 # GL1TCH DEFENDER
 
 *A fast, neon-soaked survival game built with **Phaser 3**.*
