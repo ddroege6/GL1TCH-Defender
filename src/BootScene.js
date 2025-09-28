@@ -7,7 +7,7 @@
     preload() {
       // --- Art assets (use whatever paths you keep in /assets) ---
       // Background for Home screen
-      this.load.image('home_bg', 'assets/GL1TCH cover new.png');
+      this.load.image('home_bg', 'assets/ui/main_menu.png');
 
       // Tiles
       this.load.image('tile_path_clean',    'assets/tile_path_clean.png');
