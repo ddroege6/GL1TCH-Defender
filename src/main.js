@@ -1,56 +1,39 @@
 'use strict';
 
-// Scenes are exposed on window.* by each file below.
-const scenes = [window.BootScene, window.HomeScene, window.PlayScene, window.DeathScene];
+(function () {
+  const BASE_W = 1280;
+  const BASE_H = 720;
 
-// Base canvas size; we use RESIZE so your scene code stays responsive.
-const BASE_W = 1280;
-const BASE_H = 720;
+  window.addEventListener('load', () => {
+    const config = {
+      type: Phaser.AUTO,
+      width: BASE_W,
+      height: BASE_H,
+      backgroundColor: '#0b1118',
+      render: { pixelArt: true, antialias: false, roundPixels: true, powerPreference: 'high-performance' },
+      scale: { mode: Phaser.Scale.RESIZE, autoCenter: Phaser.Scale.CENTER_BOTH },
+      physics: { default: 'arcade', arcade: { gravity: { y: 0 }, debug: false } },
+      // ✅ keyboard + mouse + touch + controller
+      input: { keyboard: true, mouse: true, touch: true, gamepad: true },
+      scene: []
+    };
 
-const config = {
-  type: Phaser.AUTO,
-  width: BASE_W,
-  height: BASE_H,
-  backgroundColor: '#0b1118',
+    const game = new Phaser.Game(config);
 
-  render: {
-    pixelArt: true,
-    antialias: false,
-    roundPixels: true,
-    powerPreference: 'high-performance',
-  },
+    const addIf = (key, ctor, autoStart = false) => {
+      if (ctor && !game.scene.keys[key]) game.scene.add(key, ctor, autoStart);
+    };
 
-  scale: {
-    mode: Phaser.Scale.RESIZE,
-    autoCenter: Phaser.Scale.CENTER_BOTH,
-  },
+    // Register scenes deterministically; Boot preloads art then shows Home
+    addIf('BootScene',  window.BootScene,  false);
+    addIf('HomeScene',  window.HomeScene,  false);
+    addIf('PlayScene',  window.PlayScene,  false);
 
-  physics: {
-    default: 'arcade',
-    arcade: {
-      gravity: { y: 0 },
-      debug: false,
-    },
-  },
+    game.scene.start('BootScene');
 
-  input: { keyboard: true, mouse: true, touch: true, gamepad: false },
-
-  scene: scenes,
-};
-
-window.addEventListener('load', () => {
-  const game = new Phaser.Game(config);
-
-  // Prevent mobile rubber-banding while touching the canvas.
-  document.body.addEventListener(
-    'touchmove',
-    (e) => { if (e.target && e.target.tagName === 'CANVAS') e.preventDefault(); },
-    { passive: false }
-  );
-
-  // Handle live DPR changes.
-  const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
-  mq && mq.addEventListener?.('change', () => {
-    game.renderer.resize(game.scale.gameSize.width, game.scale.gameSize.height);
+    // Prevent mobile rubber-banding while touching the canvas
+    document.body.addEventListener('touchmove', (e) => {
+      if (e.target && e.target.tagName === 'CANVAS') e.preventDefault();
+    }, { passive: false });
   });
-});
+})();

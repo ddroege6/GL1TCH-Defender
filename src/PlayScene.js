@@ -1,12 +1,12 @@
 'use strict';
 
 /**
- * GL1TCH Defense — PlayScene (polished w/ reliable contact death)
- * - Centered circular bodies for player/enemies
- * - Cleanse radius = 72px (3 tiles)
- * - Corrupt tiles are replaced when cleansed
- * - Proximity fallback check for contact kill (in case an overlap tick is missed)
- * - NEW: Retry button on defeat overlay
+ * GL1TCH Defense — PlayScene (polished + controller support + auto-centered racks)
+ * - Movement: Left stick / D-pad
+ * - Cleanse (hold): RT or LT (triggers) or X
+ * - Blink (dash): A (face bottom) or RB
+ * - Aim for blink: Right stick (preferred), else left stick direction; fallback to pointer
+ * - Racks: rows/cols auto-center vertically & horizontally with safe margins
  */
 
 window.PlayScene = new Phaser.Class({
@@ -26,12 +26,12 @@ window.PlayScene = new Phaser.Class({
     blinkDist: 180,
     blinkCooldown: 1.6,
     cleanseRadius: 72,            // 3 tiles
-    displayW: 28, displayH: 28,
+    displayW: 32, displayH: 32,
     bodyRadius: 16
   },
 
   ENEMIES: {
-    speedMin: 60, speedMax: 110,
+    speedMin: 60, speedMax: 140,
     spawnEvery: 1200,
     displayW: 20, displayH: 20,
     bodyRadius: 12,
@@ -41,7 +41,7 @@ window.PlayScene = new Phaser.Class({
   DIFFICULTY: {
     waveTime: 30,
     enemyCapStart: 10,
-    enemyCapPerWave: 10,
+    enemyCapPerWave: 15,
     disperseStartPct: 0.04,
     dispersePerWavePct: 0.02,
     corruptionSeeds: 3,
@@ -49,13 +49,14 @@ window.PlayScene = new Phaser.Class({
     corruptionTickMS: 250,
   },
 
+  // Layout is now auto-centered; margins are used as safe padding
   RACK_LAYOUT: {
-    cols: 12, rows: 2,
-    tilesHigh: 12,
+    cols: 8,
+    rows: 3,
+    tilesHigh: 10,
     tilesWide: 2,                 // 2×12 columns
-    xMarginPct: 0.12,
-    topYPct: 0.30,
-    rowGapPct: 0.38,
+    xMarginPct: 0.12,             // horizontal safe padding (% of width)
+    yMarginPct: 0.12              // vertical safe padding (% of height)
   },
 
   COLORS: {
@@ -105,22 +106,31 @@ window.PlayScene = new Phaser.Class({
       .setMaxVelocity(this.PLAYER.speed)
       .setCollideWorldBounds(true);
 
-    // Center the circular body after scaling (critical for accurate overlaps)
+    // Center circular body after scaling
     this.player.body.setOffset(
       this.player.width  / 2 - this.PLAYER.bodyRadius,
       this.player.height / 2 - this.PLAYER.bodyRadius
     );
 
-    // Precompute squared distance threshold for proximity kill (slightly forgiving)
-    const extra = 2; // shrink a tad so visual touch kills
+    // Proximity kill radius^2
+    const extra = 2;
     const killR = this.PLAYER.bodyRadius + this.ENEMIES.bodyRadius - extra;
     this._killDist2 = killR * killR;
 
-    // Input
+    // Keyboard/Mouse
     this.cursors  = this.input.keyboard.createCursorKeys();
     this.keys     = this.input.keyboard.addKeys('W,A,S,D,E,SHIFT,SPACE');
     this.pointer  = this.input.activePointer;
     this.prevRMB  = false;
+
+    // Controller (guarded)
+    this.pad = null;
+    this.prevPadButtons = new Array(20).fill(false);
+    if (this.input.gamepad) {
+      if (this.input.gamepad.total) this.pad = this.input.gamepad.getPad(0);
+      this.input.gamepad.on('connected',    (p)=>{ if(!this.pad) this.pad=p; });
+      this.input.gamepad.on('disconnected', (p)=>{ if(this.pad && this.pad.index===p.index) this.pad=null; });
+    }
 
     // Cleanse ring
     this.cleanseGfx = this.add.graphics().setDepth(6).setAlpha(0);
@@ -137,14 +147,8 @@ window.PlayScene = new Phaser.Class({
     // Timers
     this.time.addEvent({ delay: this.ENEMIES.spawnEvery,          loop: true, callback: () => this._maybeSpawnEnemy() });
     this.time.addEvent({ delay: this.DIFFICULTY.corruptionTickMS, loop: true, callback: () => this._spreadCorruptionTick() });
-    this.time.addEvent({
-      delay: 1000, loop: true,
-      callback: () => { if (--this.waveTimeLeft <= 0) this._nextWave(); }
-    });
-    this.time.addEvent({
-      delay: this.ENEMIES.retargetMS, loop: true,
-      callback: () => this._retargetEnemies()
-    });
+    this.time.addEvent({ delay: 1000, loop: true, callback: () => { if (--this.waveTimeLeft <= 0) this._nextWave(); } });
+    this.time.addEvent({ delay: this.ENEMIES.retargetMS, loop: true, callback: () => this._retargetEnemies() });
 
     this._buildHUD();
   },
@@ -153,11 +157,9 @@ window.PlayScene = new Phaser.Class({
     if (this.dead) return;
     this._updateMovement();
     this._updateCleanse();
-
-    // Fallback proximity kill (covers any rare missed overlap tick)
     this._checkProximityKills();
-
     this._updateHUD();
+    this._storePadStates();
   },
 
   /* -------- Helper textures -------- */
@@ -180,34 +182,48 @@ window.PlayScene = new Phaser.Class({
   _buildFloor() {
     const key = this.textures.exists('tile_path_clean') ? 'tile_path_clean' : 'clean_fallback';
     const src = this.textures.get(key).getSourceImage();
-    const ts  = this.add.tileSprite(0, 0, this.W, this.H, key)
-      .setOrigin(0, 0)
-      .setDepth(0);
+    const ts  = this.add.tileSprite(0, 0, this.W, this.H, key).setOrigin(0, 0).setDepth(0);
     ts.tileScaleX = this.TILE / src.width;
     ts.tileScaleY = this.TILE / src.height;
   },
 
-  /* -------- Racks -------- */
+  /* -------- Racks (auto-centered) -------- */
   _buildRacks() {
     const T = this.TILE;
-    const { cols, rows, tilesHigh, tilesWide, xMarginPct, topYPct, rowGapPct } = this.RACK_LAYOUT;
+    const { cols, rows, tilesHigh, tilesWide, xMarginPct = 0.10, yMarginPct = 0.12 } = this.RACK_LAYOUT;
 
-    const left  = this.W * xMarginPct;
-    const right = this.W * (1 - xMarginPct);
-    const span  = right - left;
-    const stepX = cols > 1 ? span / (cols - 1) : 0;
+    // Rack physical size
+    const rackHalfW = (tilesWide * T) / 2;
+    const rackHalfH = (tilesHigh * T) / 2;
 
-    const rowYs = [];
-    for (let r = 0; r < rows; r++) {
-      rowYs.push(Phaser.Math.Clamp(this.H * (topYPct + r * rowGapPct), T * 2, this.H - T * 2));
+    // Safe margins (at least 2 tiles + half the rack)
+    const padX = Math.max(Math.round(this.W * xMarginPct), T * 2);
+    const padY = Math.max(Math.round(this.H * yMarginPct), T * 2);
+
+    // Horizontal span for centers
+    const left  = rackHalfW + padX;
+    const right = this.W - rackHalfW - padX;
+    const usableW = Math.max(0, right - left);
+    const stepX = cols > 1 ? (usableW / (cols - 1)) : 0;
+
+    // Vertical span for centers (auto center rows)
+    const top    = rackHalfH + padY;
+    const bottom = this.H - rackHalfH - padY;
+    const usableH = Math.max(0, bottom - top);
+    let rowYs = [];
+    if (rows <= 1 || usableH <= 0) {
+      rowYs = [this.H / 2]; // center if only one row or too tight
+    } else {
+      const stepY = usableH / (rows - 1);
+      for (let r = 0; r < rows; r++) rowYs.push(top + r * stepY);
     }
 
     const rackKey = this.textures.exists('rack_tile') ? 'rack_tile'
                   : (this.textures.exists('tile_path_clean') ? 'tile_path_clean' : 'rack_fallback');
 
     const addRack = (cx, cy) => {
-      const yTop  = Math.round(cy - (tilesHigh / 2) * T);
-      const xLeft = Math.round(cx - (tilesWide / 2) * T) + T / 2;
+      const yTop  = Math.round(cy - rackHalfH);
+      const xLeft = Math.round(cx - rackHalfW) + T / 2;
 
       for (let i = 0; i < tilesHigh; i++) {
         for (let j = 0; j < tilesWide; j++) {
@@ -226,8 +242,10 @@ window.PlayScene = new Phaser.Class({
     };
 
     for (let r = 0; r < rows; r++) {
+      const cy = Math.round(rowYs[r]);
       for (let c = 0; c < cols; c++) {
-        addRack(Math.round(left + c * stepX), rowYs[r]);
+        const cx = Math.round(left + c * stepX);
+        addRack(cx, cy);
       }
     }
   },
@@ -257,10 +275,8 @@ window.PlayScene = new Phaser.Class({
       const ny = Phaser.Math.Clamp(y + Phaser.Math.Between(-radius, radius), T * 2, this.H - T * 2);
 
       this.tweens.add({
-        targets: sprite,
-        x: nx, y: ny,
-        duration: Phaser.Math.Between(450, 900),
-        ease: 'Sine.easeInOut',
+        targets: sprite, x: nx, y: ny,
+        duration: Phaser.Math.Between(450, 900), ease: 'Sine.easeInOut',
         onComplete: () => {
           const ph = this.physics.add.staticImage(sprite.x, sprite.y, rackKey)
             .setOrigin(0.5).setDisplaySize(T, T).setDepth(2).setAlpha(0.98);
@@ -379,66 +395,86 @@ window.PlayScene = new Phaser.Class({
     this._aimEnemy(e);
   },
 
-  _retargetEnemies() {
-    if (this.dead) return;
-    this.enemies.getChildren().forEach(e => this._aimEnemy(e));
-  },
+  _retargetEnemies() { if (!this.dead) this.enemies.getChildren().forEach(e => this._aimEnemy(e)); },
 
   _aimEnemy(e) {
     if (!e || !e.active) return;
-    const ang = Phaser.Math.Angle.Between(e.x, e.y, this.player.x, this.player.y)
-              + Phaser.Math.FloatBetween(-0.20, 0.20);
+    const ang = Phaser.Math.Angle.Between(e.x, e.y, this.player.x, this.player.y) + Phaser.Math.FloatBetween(-0.20, 0.20);
     const spd = e.baseSpeed || Phaser.Math.Between(this.ENEMIES.speedMin, this.ENEMIES.speedMax);
-    e.setVelocity(Math.cos(ang) * spd, Math.sin(ang) * spd);
-    e.setFlipX(e.body.velocity.x < 0);
+    e.setVelocity(Math.cos(ang)*spd, Math.sin(ang)*spd).setFlipX(e.body.velocity.x < 0);
   },
 
-  _handleHit(player, enemy) {
-    if (this.dead || !player.active || !enemy.active) return;
-    this._onPlayerDeath();
-  },
+  _handleHit(player, enemy) { if (!this.dead && player.active && enemy.active) this._onPlayerDeath(); },
 
-  // Distance-based fallback (runs every frame)
   _checkProximityKills() {
     if (this.dead) return;
     const px = this.player.x, py = this.player.y;
     const list = this.enemies.getChildren();
     for (let i = 0; i < list.length; i++) {
-      const e = list[i];
-      if (!e.active) continue;
+      const e = list[i]; if (!e.active) continue;
       const dx = e.x - px, dy = e.y - py;
-      if (dx * dx + dy * dy <= this._killDist2) {
-        this._onPlayerDeath();
-        return;
-      }
+      if (dx*dx + dy*dy <= this._killDist2) { this._onPlayerDeath(); return; }
     }
   },
 
   /* -------- Movement / Cleanse / Blink -------- */
+
+  _deadzone(v, dz = 0.2) { return Math.abs(v) < dz ? 0 : v; },
+
   _updateMovement() {
     const v = new Phaser.Math.Vector2(0, 0);
     const sp = this.PLAYER.speed;
 
-    if (this.cursors.left.isDown || this.keys.A.isDown) v.x -= sp;
-    if (this.cursors.right.isDown || this.keys.D.isDown) v.x += sp;
-    if (this.cursors.up.isDown || this.keys.W.isDown) v.y -= sp;
-    if (this.cursors.down.isDown || this.keys.S.isDown) v.y += sp;
+    // Keyboard
+    if (this.cursors.left.isDown || this.keys.A.isDown)  v.x -= 1;
+    if (this.cursors.right.isDown || this.keys.D.isDown) v.x += 1;
+    if (this.cursors.up.isDown || this.keys.W.isDown)    v.y -= 1;
+    if (this.cursors.down.isDown || this.keys.S.isDown)  v.y += 1;
 
-    this.player.setVelocity(v.x, v.y);
-    if (Math.abs(v.x) > 2) this.player.setFlipX(v.x < 0);
+    // Gamepad — left stick + D-pad
+    if (this.pad) {
+      let lx = this._deadzone(this.pad.axes[0]?.getValue() || 0);
+      let ly = this._deadzone(this.pad.axes[1]?.getValue() || 0);
+      if (this.pad.buttons[14]?.pressed) lx = -1;
+      if (this.pad.buttons[15]?.pressed) lx = +1;
+      if (this.pad.buttons[12]?.pressed) ly = -1;
+      if (this.pad.buttons[13]?.pressed) ly = +1;
+      v.x = Math.abs(lx) > Math.abs(v.x) ? lx : v.x;
+      v.y = Math.abs(ly) > Math.abs(v.y) ? ly : v.y;
+    }
 
-    // Blink (space or right mouse edge)
+    if (v.lengthSq() > 1) v.normalize();
+    this.player.setVelocity(v.x * sp, v.y * sp);
+    if (Math.abs(v.x) > 0.01) this.player.setFlipX(v.x < 0);
+
+    // Blink: keyboard Space OR gamepad A(0) / RB(5) edge
     const now = this.time.now / 1000;
-    const rmbDown = (this.input.mousePointer && this.input.mousePointer.rightButtonDown())
-      ? this.input.mousePointer.rightButtonDown()
-      : false;
-
-    const blinkPressed = Phaser.Input.Keyboard.JustDown(this.keys.SPACE) || (rmbDown && !this.prevRMB);
+    const rmbDown = (this.input.mousePointer && this.input.mousePointer.rightButtonDown?.()) ? this.input.mousePointer.rightButtonDown() : false;
+    const kbBlink = Phaser.Input.Keyboard.JustDown(this.keys.SPACE);
+    const padBlink = this._padEdge(0) || this._padEdge(5);
+    const blinkPressed = kbBlink || padBlink || (rmbDown && !this.prevRMB);
     this.prevRMB = rmbDown;
 
     if (blinkPressed && (now - this.lastBlinkAt) >= this.PLAYER.blinkCooldown) {
       this.lastBlinkAt = now;
-      const aim = Phaser.Math.Angle.Between(this.player.x, this.player.y, this.pointer.worldX, this.pointer.worldY);
+
+      // Aim: right stick > left stick > pointer
+      let ax = 0, ay = 0;
+      if (this.pad) {
+        ax = this._deadzone(this.pad.axes[2]?.getValue() || 0);
+        ay = this._deadzone(this.pad.axes[3]?.getValue() || 0);
+        if (Math.abs(ax) < 0.15 && Math.abs(ay) < 0.15) {
+          ax = this._deadzone(this.pad.axes[0]?.getValue() || 0);
+          ay = this._deadzone(this.pad.axes[1]?.getValue() || 0);
+        }
+      }
+      let aim;
+      if (Math.abs(ax) >= 0.15 || Math.abs(ay) >= 0.15) {
+        aim = Math.atan2(ay, ax);
+      } else {
+        aim = Phaser.Math.Angle.Between(this.player.x, this.player.y, this.pointer.worldX, this.pointer.worldY);
+      }
+
       const nx = Phaser.Math.Clamp(this.player.x + Math.cos(aim) * this.PLAYER.blinkDist, 20, this.W - 20);
       const ny = Phaser.Math.Clamp(this.player.y + Math.sin(aim) * this.PLAYER.blinkDist, 20, this.H - 20);
       this.player.setPosition(nx, ny);
@@ -446,10 +482,11 @@ window.PlayScene = new Phaser.Class({
   },
 
   _updateCleanse() {
-    const leftDown = this.input.activePointer.isDown && !(
-      this.input.mousePointer && this.input.mousePointer.rightButtonDown && this.input.mousePointer.rightButtonDown()
-    );
-    const want = this.keys.E.isDown || this.keys.SHIFT.isDown || leftDown;
+    // Mouse left (not right) OR keyboard (E / Shift) OR gamepad triggers (6,7) held OR X (2) held
+    const leftDown = this.input.activePointer.isDown && !(this.input.mousePointer?.rightButtonDown?.() && this.input.mousePointer.rightButtonDown());
+    const kbHold = this.keys.E.isDown || this.keys.SHIFT.isDown;
+    const padTrigger = this.pad && ((this.pad.buttons[7]?.value > 0.25) || (this.pad.buttons[6]?.value > 0.25) || this.pad.buttons[2]?.pressed);
+    const want = leftDown || kbHold || padTrigger;
 
     const gfx = this.cleanseGfx;
     if (want) {
@@ -489,11 +526,7 @@ window.PlayScene = new Phaser.Class({
   },
 
   /* -------- Waves / HUD / Death -------- */
-  _nextWave() {
-    this.wave++;
-    this.waveTimeLeft = this.DIFFICULTY.waveTime;
-    this._disperseRackTilesForWave();
-  },
+  _nextWave() { this.wave++; this.waveTimeLeft = this.DIFFICULTY.waveTime; this._disperseRackTilesForWave(); },
 
   _onPlayerDeath() {
     this.dead = true;
@@ -516,17 +549,29 @@ window.PlayScene = new Phaser.Class({
       { fontFamily: 'monospace', fontSize: 24, color: '#ffffff', align: 'center' }
     ).setOrigin(0.5).setDepth(101);
 
-    // NEW: Retry button — restart this scene
-    const retryBtn = this.add.text(this.W / 2, this.H / 2 + 26, 'Retry', {
-      fontFamily: 'monospace', fontSize: 18, color: '#a8e1ff', backgroundColor: '#0b1118'
-    }).setOrigin(0.5).setPadding(8, 6, 8, 6).setDepth(101).setInteractive({ useHandCursor: true });
+    // Retry / Home (mouse)
+    const retryBtn = this.add.text(this.W/2, this.H/2 + 26, 'Retry', { fontFamily:'monospace', fontSize:18, color:'#a8e1ff', backgroundColor:'#0b1118' })
+      .setOrigin(0.5).setPadding(8,6,8,6).setDepth(101).setInteractive({useHandCursor:true});
     retryBtn.on('pointerup', () => this.scene.restart());
 
-    // Existing: Return to Home
-    const homeBtn = this.add.text(this.W / 2, this.H / 2 + 60, 'Return to Home', {
-      fontFamily: 'monospace', fontSize: 18, color: '#a8e1ff', backgroundColor: '#0b1118'
-    }).setOrigin(0.5).setPadding(8, 6, 8, 6).setDepth(101).setInteractive({ useHandCursor: true });
+    const homeBtn = this.add.text(this.W/2, this.H/2 + 60, 'Return to Home', { fontFamily:'monospace', fontSize:18, color:'#a8e1ff', backgroundColor:'#0b1118' })
+      .setOrigin(0.5).setPadding(8,6,8,6).setDepth(101).setInteractive({useHandCursor:true});
     homeBtn.on('pointerup', () => this.scene.start('HomeScene'));
+
+    // Controller/keyboard on overlay
+    const retry = () => this.scene.restart();
+    const home  = () => this.scene.start('HomeScene');
+    this.input.keyboard.once('keydown-ENTER', retry);
+    this.input.keyboard.once('keydown-SPACE', retry);
+    this.input.keyboard.once('keydown-ESC',   home);
+
+    if (this.input.gamepad) {
+      if (this.input.gamepad.total) this.pad = this.input.gamepad.getPad(0) || this.pad;
+      this.time.addEvent({ delay: 100, loop: true, callback: () => {
+        const a = this.pad?.buttons[0]?.pressed, b = this.pad?.buttons[1]?.pressed, start = this.pad?.buttons[9]?.pressed;
+        if (a) retry(); else if (b || start) home();
+      }});
+    }
   },
 
   _buildHUD() {
@@ -542,4 +587,18 @@ window.PlayScene = new Phaser.Class({
     this.hud.setText(`WAVE ${this.wave} | 00:${sec} | Corrupt: ${corruptPct}% | Secured: ${this.cleansedCount}`);
   },
 
+  /* -------- Gamepad helpers -------- */
+  _padEdge(i) {
+    if (!this.pad) return false;
+    const now = !!(this.pad.buttons[i] && this.pad.buttons[i].pressed);
+    const prev = !!this.prevPadButtons[i];
+    this.prevPadButtons[i] = now;
+    return now && !prev;
+  },
+  _storePadStates() {
+    if (!this.pad) return;
+    for (let i = 0; i < this.prevPadButtons.length; i++) {
+      this.prevPadButtons[i] = !!(this.pad.buttons[i] && this.pad.buttons[i].pressed);
+    }
+  },
 });
